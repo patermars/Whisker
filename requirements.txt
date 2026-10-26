@@ -1,9 +1,13 @@
+# Prefer PyTorch's CPU wheel index; PyPI supplies the other project packages.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
 python-chess>=1.10.0
 zstandard>=0.22.0
 h5py>=3.10.0
 numpy>=1.24.0
 requests>=2.31.0
-torch>=2.1.0
+torch==2.12.0+cpu
 tqdm>=4.66.0
 
 # === Logging (optional — train.py auto-detects) ===
