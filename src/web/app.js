@@ -14,9 +14,21 @@ const MODES = {
   ],
 };
 
-const PIECES = {
-  white: { k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙" },
-  black: { k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟" },
+const PIECE_NAMES = {
+  k: "king",
+  q: "queen",
+  r: "rook",
+  b: "bishop",
+  n: "knight",
+  p: "pawn",
+};
+const SOUND_FILES = {
+  move: "/assets/audio/move.mp3",
+  capture: "/assets/audio/capture.mp3",
+  castle: "/assets/audio/castle.mp3",
+  check: "/assets/audio/check.mp3",
+  promote: "/assets/audio/promote.mp3",
+  gameend: "/assets/audio/gameend.mp3",
 };
 const FILES = "abcdefgh";
 const RANKS = "87654321";
@@ -40,6 +52,8 @@ const ui = {
   audioUnlockPromise: null,
   audioLoadFailed: false,
   pendingMove: null,
+  drag: null,
+  suppressBoardClick: false,
   startingGame: false,
   studyGame: null,
   studyTimer: null,
@@ -103,6 +117,13 @@ function parseUciMove(uci) {
   return { from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || null };
 }
 
+function setAvatarPieces(topColor, bottomColor) {
+  const topPiece = $(".opponent-avatar img");
+  const bottomPiece = $(".self-avatar img");
+  if (topPiece) topPiece.src = `/assets/pieces/wintrchess/standard/${topColor}_king.svg`;
+  if (bottomPiece) bottomPiece.src = `/assets/pieces/wintrchess/standard/${bottomColor}_king.svg`;
+}
+
 function unlockAudio() {
   if (!ui.soundEnabled) return Promise.resolve(false);
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -119,10 +140,7 @@ function unlockAudio() {
   const audioContext = ui.audioContext;
   ui.audioUnlockPromise = audioContext.resume().then(async () => {
     if (!ui.audioBuffers) {
-      const entries = await Promise.all(Object.entries({
-        move: "/audio/move.wav",
-        capture: "/audio/capture.wav",
-      }).map(async ([name, url]) => {
+      const entries = await Promise.all(Object.entries(SOUND_FILES).map(async ([name, url]) => {
         const response = await fetch(url);
         if (!response.ok) throw new Error(`Could not load ${name} sound (${response.status}).`);
         const buffer = await response.arrayBuffer();
@@ -144,11 +162,11 @@ function unlockAudio() {
   return ui.audioUnlockPromise;
 }
 
-function playMoveSound(capture = false) {
+function playMoveSound(sound = "move") {
   if (!ui.soundEnabled) return;
   const play = () => {
     const audioContext = ui.audioContext;
-    const buffer = ui.audioBuffers?.[capture ? "capture" : "move"];
+    const buffer = ui.audioBuffers?.[sound] || ui.audioBuffers?.move;
     if (!audioContext || audioContext.state !== "running" || !buffer) return false;
     const source = audioContext.createBufferSource();
     const compressor = audioContext.createDynamicsCompressor();
@@ -173,7 +191,7 @@ function playMoveSound(capture = false) {
   }
 }
 
-function animateBoardMoves(moves, previousState) {
+function animateBoardMoves(moves, previousState, currentState) {
   if (!moves.length) return;
   const board = $("#chessboard");
   const pieces = { ...(previousState?.pieces || {}) };
@@ -186,7 +204,9 @@ function animateBoardMoves(moves, previousState) {
       const targetPiece = pieces[move.to];
       const isEnPassant = movingPiece?.type === "p" && move.from[0] !== move.to[0] && !targetPiece;
       const captured = Boolean(targetPiece) || isEnPassant;
-      const destination = board.querySelector(`[data-square="${move.to}"] .piece`);
+      const isCastle = movingPiece?.type === "k" && Math.abs(FILES.indexOf(move.from[0]) - FILES.indexOf(move.to[0])) === 2;
+      const isPromotion = movingPiece?.type === "p" && move.promotion && ["1", "8"].includes(move.to[1]);
+      const destination = board.querySelector(`[data-square="${move.to}"] .piece-svg`);
       const sourceSquare = board.querySelector(`[data-square="${move.from}"]`);
       const targetSquare = board.querySelector(`[data-square="${move.to}"]`);
 
@@ -198,7 +218,12 @@ function animateBoardMoves(moves, previousState) {
           { transform: "translate(0, 0) scale(1)" },
         ], { duration: 230, easing: "cubic-bezier(.2, .75, .25, 1)" });
       }
-      playMoveSound(captured);
+      let sound = isCastle ? "castle" : isPromotion ? "promote" : captured ? "capture" : "move";
+      if (index === moves.length - 1) {
+        if (currentState?.result || currentState?.game_over) sound = "gameend";
+        else if (currentState?.in_check) sound = "check";
+      }
+      playMoveSound(sound);
 
       if (movingPiece) {
         delete pieces[move.from];
@@ -245,9 +270,10 @@ function renderBoard(animationMoves = [], previousState = null) {
       if (ui.selected === square) classes.push("selected");
       if (isTarget) classes.push(piece ? "legal-capture" : "legal-empty");
       if (state.in_check === square) classes.push("in-check");
-      const pieceGlyph = piece ? `<span class="piece piece-${piece.color}" aria-hidden="true">${PIECES[piece.color][piece.type]}</span>` : "";
+      const pieceName = piece ? PIECE_NAMES[piece.type] : "";
+      const pieceGlyph = piece ? `<img class="piece-svg piece-${piece.color}" src="/assets/pieces/cburnett/${piece.color}_${pieceName}.svg" alt="" draggable="false" />` : "";
       const description = piece ? `${piece.color} ${piece.type} on ${square}` : square;
-      squares.push(`<button class="${classes.join(" ")}" type="button" role="gridcell" data-square="${square}" aria-label="${description}" aria-selected="${ui.selected === square}" ${canMove && piece?.color === ui.playerColor ? 'draggable="true"' : ""}>${pieceGlyph}</button>`);
+      squares.push(`<button class="${classes.join(" ")}" type="button" role="gridcell" data-square="${square}" aria-label="${description}" aria-selected="${ui.selected === square}">${pieceGlyph}</button>`);
     });
   });
 
@@ -256,29 +282,73 @@ function renderBoard(animationMoves = [], previousState = null) {
   $("#rank-labels").innerHTML = ranks.map((rank) => `<span>${rank}</span>`).join("");
   $("#file-labels").innerHTML = files.map((file) => `<span>${file}</span>`).join("");
   board.querySelectorAll(".square").forEach((squareButton) => {
-    squareButton.addEventListener("click", () => onSquareClick(squareButton.dataset.square));
-    squareButton.addEventListener("dragstart", (event) => {
-      const source = squareButton.dataset.square;
-      const selectedPiece = state.pieces?.[source];
-      if (!canMove || selectedPiece?.color !== ui.playerColor) {
+    squareButton.addEventListener("click", (event) => {
+      if (ui.suppressBoardClick) {
+        ui.suppressBoardClick = false;
         event.preventDefault();
         return;
       }
-      event.dataTransfer.setData("text/plain", source);
-      event.dataTransfer.effectAllowed = "move";
-      ui.selected = source;
-      squareButton.classList.add("selected");
+      onSquareClick(squareButton.dataset.square);
     });
-    squareButton.addEventListener("dragover", (event) => {
-      if (canMove) event.preventDefault();
-    });
-    squareButton.addEventListener("drop", (event) => {
+    squareButton.addEventListener("pointerdown", (event) => {
+      const source = squareButton.dataset.square;
+      const selectedPiece = state.pieces?.[source];
+      if (event.button !== 0 || !canMove || selectedPiece?.color !== ui.playerColor) return;
       event.preventDefault();
-      const source = event.dataTransfer.getData("text/plain");
-      if (source) submitMove(source, squareButton.dataset.square);
+      const pieceImage = squareButton.querySelector(".piece-svg");
+      if (!pieceImage) return;
+      const rect = pieceImage.getBoundingClientRect();
+      ui.drag = {
+        pointerId: event.pointerId,
+        source,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+        image: pieceImage,
+        clone: null,
+        moved: false,
+      };
+      squareButton.setPointerCapture(event.pointerId);
+    });
+    squareButton.addEventListener("pointermove", (event) => {
+      const drag = ui.drag;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 4) {
+        drag.moved = true;
+        ui.selected = drag.source;
+        drag.clone = drag.image.cloneNode(true);
+        drag.clone.classList.add("piece-drag-ghost");
+        drag.clone.style.width = `${drag.image.getBoundingClientRect().width}px`;
+        drag.clone.style.height = `${drag.image.getBoundingClientRect().height}px`;
+        document.body.append(drag.clone);
+        drag.image.classList.add("is-drag-source");
+        board.classList.add("is-dragging");
+      }
+      if (drag.moved) {
+        event.preventDefault();
+        drag.clone.style.transform = `translate3d(${event.clientX - drag.offsetX}px, ${event.clientY - drag.offsetY}px, 0)`;
+      }
+    });
+    squareButton.addEventListener("pointerup", (event) => {
+      const drag = ui.drag;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      ui.drag = null;
+      if (drag.moved) {
+        ui.suppressBoardClick = true;
+        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".square[data-square]")?.dataset.square;
+        drag.clone?.remove();
+        drag.image.classList.remove("is-drag-source");
+        board.classList.remove("is-dragging");
+        if (target) submitMove(drag.source, target);
+        else renderBoard();
+        window.setTimeout(() => { ui.suppressBoardClick = false; }, 0);
+      } else {
+        // The resulting click event keeps click-to-select behavior in one path.
+      }
     });
   });
-  animateBoardMoves(animationMoves, previousState);
+  animateBoardMoves(animationMoves, previousState, state);
 }
 
 function onSquareClick(square) {
@@ -462,6 +532,7 @@ function acceptState(state) {
   }
   ui.state = state;
   ui.playerColor = state.player_color || ui.playerColor;
+  setAvatarPieces(ui.playerColor === "white" ? "black" : "white", ui.playerColor);
   if (!state.started) ui.flipped = false;
   $("#player-caption").textContent = `Playing as ${capitalize(ui.playerColor)}`;
   $("#game-title").textContent = state.mode ? `${capitalize(state.mode)} · ${state.time_control}` : "New game";
@@ -646,17 +717,12 @@ function setStudyPly(ply) {
     if (move) {
       animationMoves.push(move);
       animationSource = ui.studyGame.frames[previousPly];
-      const movingPiece = animationSource.pieces[move.from];
-      const captured = Boolean(animationSource.pieces[move.to])
-        || (movingPiece?.type === "p" && move.from[0] !== move.to[0]);
-      playMoveSound(captured);
     }
   } else if (ui.studyGame.cursor === previousPly - 1) {
     const move = parseUciMove(ui.studyGame.frames[previousPly].last_move);
     if (move) {
       animationMoves.push({ ...move, from: move.to, to: move.from });
       animationSource = ui.studyGame.frames[previousPly];
-      playMoveSound(false);
     }
   }
   renderStudyView(animationMoves, animationSource);
@@ -672,6 +738,7 @@ function renderStudyView(animationMoves = [], animationSource = null) {
   const blackView = ui.flipped ? ui.playerColor !== "black" : ui.playerColor === "black";
   const topColor = blackView ? "white" : "black";
   const bottomColor = topColor === "white" ? "black" : "white";
+  setAvatarPieces(topColor, bottomColor);
   const names = { white, black };
 
   document.body.classList.add("is-reviewing");

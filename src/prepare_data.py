@@ -1,46 +1,20 @@
-"""
-prepare_data.py — Download & Preprocess Lichess Open Database for AlphaZero Training
-=====================================================================================
-
-Reads a month's PGN archive from https://database.lichess.org or a local
-download, filters for high-quality rapid/classical games, encodes every board
-position into an (18, 8, 8) tensor, and writes compressed HDF5 files.
-
-HDF5 Schema
------------
-  boards   : float16, shape (N, 18, 8, 8)  — board state tensors
-  policies : int16,   shape (N,)            — UCI move index (from_sq * 64 + to_sq)
-  values   : int8,    shape (N,)            — game outcome from side-to-move (+1/0/−1)
-
-Tensor Layout (18 planes, each 8×8)
-------------------------------------
-  Plane  0 : white pawns          Plane  6 : black pawns
-  Plane  1 : white knights        Plane  7 : black knights
-  Plane  2 : white bishops        Plane  8 : black bishops
-  Plane  3 : white rooks          Plane  9 : black rooks
-  Plane  4 : white queens         Plane 10 : black queens
-  Plane  5 : white king           Plane 11 : black king
-  Plane 12 : white kingside castling  (all 1s if right exists)
-  Plane 13 : white queenside castling
-  Plane 14 : black kingside castling
-  Plane 15 : black queenside castling
-  Plane 16 : en passant target square (1 on the square, 0 elsewhere)
-  Plane 17 : side to move (all 1s = white, all 0s = black)
-
-CLI Usage
----------
-  python -m src.prepare_data --month 2024-01 --min-elo 2000 --output data.h5
-  python -m src.prepare_data --month 2024-01 --max-games 5000   # quick test run
-  python -m src.prepare_data --month 2024-01 --archive month.pgn.zst --all-elo-bands
-"""
+"""Prepare Lichess PGN archives as HDF5 chess datasets."""
 
 import argparse
+import hashlib
 import io
 import os
-import random
+import signal
 import sys
 import time
-from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from collections import deque
+from concurrent.futures import (
+    ALL_COMPLETED,
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    wait,
+)
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
@@ -54,35 +28,25 @@ from tqdm import tqdm
 
 from .paths import PROJECT_ROOT
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Lichess archive URL template
 LICHESS_URL = (
     "https://database.lichess.org/standard/"
     "lichess_db_standard_rated_{month}.pgn.zst"
 )
 
-# The monthly downloader builds all of these bands from one archive scan.
+# The monthly downloader builds these bands from one archive scan.
 ELO_BANDS = (
     (1000, 1200),
     (1200, 1500),
     (1500, 1800),
     (1800, 2200),
-    (2200, 2500),
-    (2500, 2700),
 )
 
-# Retain all eligible games through 2200 Elo, then sample the scarcer bands.
-# Rates are applied deterministically per month so reruns produce the same data.
+# Sampling is deterministic per month so reruns produce the same data.
 DEFAULT_ELO_SAMPLE_RATES = {
     (1000, 1200): 1.0,
     (1200, 1500): 1.0,
     (1500, 1800): 1.0,
     (1800, 2200): 1.0,
-    (2200, 2500): 0.1,
-    (2500, 2700): 0.05,
 }
 
 # Piece types in python-chess: PAWN=1 .. KING=6
@@ -102,13 +66,8 @@ PIECE_PLANE = {
     (chess.BLACK, chess.KING):   11,
 }
 
-# In-memory batch size before flushing to HDF5
 FLUSH_BATCH = 50_000
 
-
-# ---------------------------------------------------------------------------
-# UCI Move Encoding
-# ---------------------------------------------------------------------------
 
 def move_to_index(move: chess.Move) -> int:
     """Convert a chess.Move to a flat index in [0, 4095].
@@ -135,10 +94,6 @@ def index_to_move(index: int, promotion: Optional[int] = None) -> chess.Move:
     to_sq = index % 64
     return chess.Move(from_sq, to_sq, promotion=promotion)
 
-
-# ---------------------------------------------------------------------------
-# Board Encoding
-# ---------------------------------------------------------------------------
 
 def encode_board(board: chess.Board) -> np.ndarray:
     """Encode a chess.Board as an (18, 8, 8) float16 tensor.
@@ -181,10 +136,6 @@ def encode_board(board: chess.Board) -> np.ndarray:
 
     return tensor
 
-
-# ---------------------------------------------------------------------------
-# Streaming PGN Reader
-# ---------------------------------------------------------------------------
 
 class ProgressRawReader:
     """Count compressed bytes as the Zstandard reader pulls them from its source."""
@@ -293,10 +244,6 @@ def open_pgn_stream(
     return text_stream, download_progress
 
 
-# ---------------------------------------------------------------------------
-# Game Filtering
-# ---------------------------------------------------------------------------
-
 def parse_elo(header_value: Optional[str]) -> int:
     """Safely parse an ELO rating from a PGN header, returning 0 on failure."""
     if header_value is None:
@@ -369,10 +316,6 @@ def passes_filter(
     return passes_quality_filter(game)
 
 
-# ---------------------------------------------------------------------------
-# Game Processing
-# ---------------------------------------------------------------------------
-
 def outcome_value(result: str, side: chess.Color) -> int:
     """Compute the game outcome from *side*'s perspective.
 
@@ -389,6 +332,7 @@ def outcome_value(result: str, side: chess.Color) -> int:
 
 def process_game(
     game: chess.pgn.Game,
+    moves: Optional[list[chess.Move]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract all (board, policy, value) triples from a single game.
 
@@ -399,7 +343,8 @@ def process_game(
     where M is the number of positions (= number of moves in the game).
     """
     result = game.headers.get("Result", "*")
-    moves = list(game.mainline_moves())
+    if moves is None:
+        moves = list(game.mainline_moves())
 
     boards_list = []
     policies_list = []
@@ -432,16 +377,64 @@ def available_cpu_count() -> int:
     return max(1, cpu_count or 1)
 
 
-def _process_game_worker(
-    game: chess.pgn.Game,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Top-level process-pool target for CPU-heavy board encoding."""
-    return process_game(game)
+def _handle_sigterm(_signum, _frame) -> None:
+    raise KeyboardInterrupt
 
 
-# ---------------------------------------------------------------------------
-# HDF5 Writer
-# ---------------------------------------------------------------------------
+def _keep_sample(
+    month: str,
+    game_number: int,
+    band: tuple[int, int],
+    rate: float,
+) -> bool:
+    """Make a stable per-game sampling decision independent of worker order."""
+    if rate >= 1.0:
+        return True
+    sample_key = f"{month}:{game_number}:{band[0]}-{band[1]}".encode("ascii")
+    sample_value = int.from_bytes(
+        hashlib.blake2b(sample_key, digest_size=8).digest(), "big"
+    )
+    return sample_value < rate * (1 << 64)
+
+
+def _process_game_batch_worker(
+    records: list[tuple[int, str]],
+    month: str,
+    bands: tuple[tuple[int, int], ...],
+    sample_rates: dict[tuple[int, int], float],
+) -> list[
+    tuple[
+        int,
+        list[tuple[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    ]
+]:
+    """Parse, filter, sample, and encode raw PGN records in a worker process."""
+    results = []
+    for game_number, record in records:
+        game = chess.pgn.read_game(io.StringIO(record))
+        encoded_bands = []
+        if game is not None and passes_result_time_filter(game):
+            moves = list(game.mainline_moves())
+            if len(moves) >= 10:
+                matching_bands = [
+                    band
+                    for band in bands
+                    if game_matches_elo_band(game, band[0], band[1])
+                    and _keep_sample(month, game_number, band, sample_rates[band])
+                ]
+                if matching_bands:
+                    encoded = process_game(game, moves)
+                    encoded_bands = [(band, encoded) for band in matching_bands]
+        results.append((game_number, encoded_bands))
+    return results
+
+
+def _process_single_batch_worker(
+    games: list[chess.pgn.Game],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Encode a batch of games for the single-band preprocessing path."""
+    return [process_game(game) for game in games]
+
 
 class HDF5Writer:
     """Incrementally writes position data to a chunked, gzip-compressed HDF5 file."""
@@ -451,7 +444,6 @@ class HDF5Writer:
         self.f = h5py.File(path, "w")
         self.f.attrs["complete"] = False
 
-        # Create resizable datasets with chunked + gzip compression
         self.ds_boards = self.f.create_dataset(
             "boards",
             shape=(0, 18, 8, 8),
@@ -480,7 +472,6 @@ class HDF5Writer:
             compression_opts=4,
         )
 
-        # In-memory buffers for batching writes
         self._buf_boards: list[np.ndarray] = []
         self._buf_policies: list[np.ndarray] = []
         self._buf_values: list[np.ndarray] = []
@@ -510,19 +501,16 @@ class HDF5Writer:
         old_len = self.ds_boards.shape[0]
         new_len = old_len + n
 
-        # Resize all datasets
         self.ds_boards.resize(new_len, axis=0)
         self.ds_policies.resize(new_len, axis=0)
         self.ds_values.resize(new_len, axis=0)
 
-        # Write the batch
         self.ds_boards[old_len:new_len] = all_boards
         self.ds_policies[old_len:new_len] = all_policies
         self.ds_values[old_len:new_len] = all_values
 
         self.total_positions = new_len
 
-        # Clear buffers
         self._buf_boards.clear()
         self._buf_policies.clear()
         self._buf_values.clear()
@@ -543,10 +531,6 @@ class HDF5Writer:
             return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Main Pipeline
-# ---------------------------------------------------------------------------
-
 def iterate_games(text_stream: io.TextIOWrapper) -> Iterator[chess.pgn.Game]:
     """Yield chess.pgn.Game objects from a PGN text stream."""
     while True:
@@ -554,6 +538,22 @@ def iterate_games(text_stream: io.TextIOWrapper) -> Iterator[chess.pgn.Game]:
         if game is None:
             break
         yield game
+
+
+def iterate_pgn_records(text_stream: io.TextIOWrapper) -> Iterator[str]:
+    """Yield raw Lichess PGN records without parsing them in the parent process."""
+    record_lines: list[str] = []
+    for line in text_stream:
+        if line.startswith("[Event ") and record_lines:
+            record = "".join(record_lines)
+            if record.strip():
+                yield record
+            record_lines = []
+        record_lines.append(line)
+
+    record = "".join(record_lines)
+    if record.strip():
+        yield record
 
 
 def output_matches_request(
@@ -611,10 +611,6 @@ def prepare_elo_bands(
     writers: dict[tuple[int, int], HDF5Writer] = {}
     kept_games = {band: 0 for band in ELO_BANDS}
     total_positions = {band: 0 for band in ELO_BANDS}
-    samplers = {
-        band: random.Random(f"{month}:{band[0]}-{band[1]}:sample-v1")
-        for band in ELO_BANDS
-    }
 
     for min_elo, max_elo in ELO_BANDS:
         output_path = output_paths[(min_elo, max_elo)]
@@ -645,7 +641,10 @@ def prepare_elo_bands(
         print(f"[skip] All Elo bands for {month} are already complete", flush=True)
         return
 
-    print(f"[info] Encoding games with {worker_count} CPU worker(s).", flush=True)
+    print(
+        f"[info] Parsing and encoding PGN records with {worker_count} CPU worker(s).",
+        flush=True,
+    )
 
     try:
         text_stream, archive_progress = open_pgn_stream(month, archive_path)
@@ -661,95 +660,119 @@ def prepare_elo_bands(
     )
     total_games = 0
     completed = False
+    scan_finished = False
+    stop_early = False
     start_time = time.time()
-    reserved_games = {band: 0 for band in ELO_BANDS}
-    pending: dict[Future, tuple[tuple[int, int], ...]] = {}
+    pending: deque[Future] = deque()
+    batch: list[tuple[int, str]] = []
+    active_bands = tuple(writers)
+    active_rates = {band: rates[band] for band in active_bands}
     executor = (
         ProcessPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
     )
     max_pending = max(1, worker_count * 2)
+    batch_size = min(8, worker_count)
 
-    def save_result(future: Future) -> None:
-        bands = pending.pop(future)
-        boards, policies, values = future.result()
-        for band in bands:
-            reserved_games[band] -= 1
-            writers[band].add(boards, policies, values)
-            kept_games[band] += 1
-            total_positions[band] += len(boards)
+    def write_results(
+        results: list[
+            tuple[
+                int,
+                list[
+                    tuple[
+                        tuple[int, int],
+                        tuple[np.ndarray, np.ndarray, np.ndarray],
+                    ]
+                ],
+            ]
+        ],
+    ) -> None:
+        for _game_number, encoded_bands in results:
+            for band, (boards, policies, values) in encoded_bands:
+                if max_games is None or kept_games[band] < max_games:
+                    writers[band].add(boards, policies, values)
+                    kept_games[band] += 1
+                    total_positions[band] += len(boards)
 
-    def drain_pending(wait_for_all: bool = False) -> None:
+    def submit_batch() -> None:
+        if executor is not None and batch:
+            pending.append(
+                executor.submit(
+                    _process_game_batch_worker,
+                    batch.copy(),
+                    month,
+                    active_bands,
+                    active_rates,
+                )
+            )
+            batch.clear()
+
+    def drain_one() -> None:
         if not pending:
             return
-        done, _ = wait(
-            tuple(pending),
-            return_when=ALL_COMPLETED if wait_for_all else FIRST_COMPLETED,
-        )
-        for future in done:
-            save_result(future)
+        future = pending.popleft()
+        write_results(future.result())
 
     try:
-        for game in iterate_games(text_stream):
+        for record in iterate_pgn_records(text_stream):
             total_games += 1
             parsed_progress.update(1)
 
-            if passes_result_time_filter(game) and has_minimum_game_length(game):
-                matching_bands = []
-                for band in writers:
-                    if (
-                        (
-                            max_games is None
-                            or kept_games[band] + reserved_games[band] < max_games
-                        )
-                        and game_matches_elo_band(game, band[0], band[1])
-                        and samplers[band].random() < rates[band]
-                    ):
-                        matching_bands.append(band)
-                if matching_bands:
-                    if executor is None:
-                        boards, policies, values = process_game(game)
-                        for band in matching_bands:
-                            writers[band].add(boards, policies, values)
-                            kept_games[band] += 1
-                            total_positions[band] += len(boards)
-                    else:
-                        future = executor.submit(_process_game_worker, game)
-                        pending[future] = tuple(matching_bands)
-                        for band in matching_bands:
-                            reserved_games[band] += 1
+            if executor is None:
+                write_results(
+                    _process_game_batch_worker(
+                        [(total_games, record)], month, active_bands, active_rates
+                    )
+                )
+            else:
+                batch.append((total_games, record))
+                if len(batch) >= batch_size:
+                    submit_batch()
 
             if executor is not None and len(pending) >= max_pending:
-                drain_pending()
+                drain_one()
 
             if total_games % 1_000 == 0:
                 parsed_progress.set_postfix(
                     kept=" ".join(
                         f"{low}-{high}:{kept_games[(low, high)]:,}"
-                        f"(+{reserved_games[(low, high)]})"
                         for low, high in writers
                     ),
+                    queued_batches=len(pending),
                     refresh=False,
                 )
 
             if max_games is not None and all(
-                kept_games[band] + reserved_games[band] >= max_games
-                for band in writers
+                kept_games[band] >= max_games for band in writers
             ):
                 print(f"[info] Reached --max-games cap ({max_games}) for all bands.")
-                completed = True
+                scan_finished = True
+                stop_early = True
+                batch.clear()
                 break
         else:
-            completed = True
+            scan_finished = True
 
-        if executor is not None:
-            drain_pending(wait_for_all=True)
+        if executor is not None and not stop_early:
+            submit_batch()
+            while pending:
+                drain_one()
+        completed = scan_finished
     except KeyboardInterrupt:
         completed = False
-        print("\n[interrupted] Saving partial band data; keep the archive to resume.")
+        stop_early = True
+        batch.clear()
+        print(
+            "\n[interrupted] Saving completed batches and stopping pending workers; "
+            "keep the archive to resume.",
+            flush=True,
+        )
     finally:
         try:
             if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=not completed)
+                executor.shutdown(
+                    wait=True,
+                    cancel_futures=(not completed or stop_early),
+                )
             for writer in writers.values():
                 writer.close(complete=completed)
         finally:
@@ -766,6 +789,7 @@ def prepare_elo_bands(
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser(
         description="Preprocess Lichess PGN data for AlphaZero training."
     )
@@ -779,7 +803,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--all-elo-bands", action="store_true",
-        help="Parse one local archive into all six configured Elo-band datasets",
+        help="Parse one local archive into all four Elo-band datasets (up to 2200 Elo)",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=None,
@@ -806,23 +830,16 @@ def main() -> None:
         help="Maximum number of games to process (for testing)",
     )
     parser.add_argument(
-        "--sample-rate-2200-2500", type=float, default=0.1,
-        help="Fraction of eligible 2200-2500 games to retain (default: 0.1)",
-    )
-    parser.add_argument(
-        "--sample-rate-2500-2700", type=float, default=0.05,
-        help="Fraction of eligible 2500-2700 games to retain (default: 0.05)",
+        "--workers", type=int, default=available_cpu_count(),
+        help=f"CPU worker processes for game encoding (default: {available_cpu_count()})",
     )
     args = parser.parse_args()
     if args.max_elo is not None and args.max_elo < args.min_elo:
         parser.error("--max-elo must be greater than or equal to --min-elo")
     if args.max_games is not None and args.max_games < 1:
         parser.error("--max-games must be positive")
-    if not 0.0 < args.sample_rate_2200_2500 <= 1.0:
-        parser.error("--sample-rate-2200-2500 must be greater than 0 and at most 1")
-    if not 0.0 < args.sample_rate_2500_2700 <= 1.0:
-        parser.error("--sample-rate-2500-2700 must be greater than 0 and at most 1")
-
+    if args.workers < 1:
+        parser.error("--workers must be positive")
     if args.all_elo_bands:
         if args.archive is None:
             parser.error("--all-elo-bands requires --archive")
@@ -836,25 +853,18 @@ def main() -> None:
             args.archive,
             output_root,
             max_games=args.max_games,
-            sample_rates={
-                (2200, 2500): args.sample_rate_2200_2500,
-                (2500, 2700): args.sample_rate_2500_2700,
-            },
+            workers=args.workers,
             overwrite=args.overwrite,
         )
         return
     elif (
         args.output_dir is not None
         or args.overwrite
-        or args.sample_rate_2200_2500 != 0.1
-        or args.sample_rate_2500_2700 != 0.05
     ):
         parser.error(
-            "--output-dir, --overwrite, and sample-rate options require "
-            "--all-elo-bands"
+            "--output-dir and --overwrite require --all-elo-bands"
         )
 
-    # Default output filename
     output_path = (
         Path(args.output)
         if args.output
@@ -874,10 +884,8 @@ def main() -> None:
     print(f"  Max games   : {args.max_games or 'unlimited'}")
     print("=" * 70)
 
-    # Open the streaming PGN reader
     text_stream, download_progress = open_pgn_stream(args.month, args.archive)
 
-    # Open HDF5 writer
     writer = HDF5Writer(str(output_path))
     writer.f.attrs["month"] = args.month
     writer.f.attrs["min_elo"] = args.min_elo
@@ -890,19 +898,54 @@ def main() -> None:
     total_positions = 0   # running position count
     start_time = time.time()
     completed = False
+    scan_finished = False
     parsed_progress = tqdm(
         desc=f"{args.month} parsed",
         unit="games",
         position=1,
         dynamic_ncols=True,
     )
+    worker_count = args.workers
+    print(f"[info] Encoding games with {worker_count} CPU worker(s).", flush=True)
+    executor = (
+        ProcessPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
+    )
+    pending: dict[Future, None] = {}
+    batch: list[chess.pgn.Game] = []
+    reserved_games = 0
+    max_pending = max(1, worker_count * 2)
+    batch_size = min(8, worker_count)
+
+    def save_single_result(future: Future) -> None:
+        nonlocal kept_games, total_positions, reserved_games
+        pending.pop(future)
+        results = future.result()
+        reserved_games -= len(results)
+        for boards, policies, values in results:
+            writer.add(boards, policies, values)
+            kept_games += 1
+            total_positions += len(boards)
+
+    def submit_single_batch() -> None:
+        if executor is not None and batch:
+            pending[executor.submit(_process_single_batch_worker, batch.copy())] = None
+            batch.clear()
+
+    def drain_single_pending(wait_for_all: bool = False) -> None:
+        if not pending:
+            return
+        done, _ = wait(
+            tuple(pending),
+            return_when=ALL_COMPLETED if wait_for_all else FIRST_COMPLETED,
+        )
+        for future in done:
+            save_single_result(future)
 
     try:
         for game in iterate_games(text_stream):
             total_games += 1
             parsed_progress.update(1)
 
-            # Apply quality filters
             if not passes_filter(game, args.min_elo, args.max_elo):
                 if total_games % 1_000 == 0:
                     parsed_progress.set_postfix(
@@ -912,11 +955,21 @@ def main() -> None:
                     )
                 continue
 
-            # Process the game
-            boards, policies, values = process_game(game)
-            writer.add(boards, policies, values)
-            kept_games += 1
-            total_positions += len(boards)
+            # Keep a bounded queue so workers stay busy without growing memory use.
+            if executor is None:
+                boards, policies, values = process_game(game)
+                writer.add(boards, policies, values)
+                kept_games += 1
+                total_positions += len(boards)
+            else:
+                if args.max_games is None or kept_games + reserved_games < args.max_games:
+                    batch.append(game)
+                    reserved_games += 1
+                    if len(batch) >= batch_size:
+                        submit_single_batch()
+                if len(pending) >= max_pending:
+                    submit_single_batch()
+                    drain_single_pending()
 
             if total_games % 1_000 == 0:
                 parsed_progress.set_postfix(
@@ -925,18 +978,32 @@ def main() -> None:
                     refresh=False,
                 )
 
-            # Early stop for testing
-            if args.max_games and kept_games >= args.max_games:
-                print(f"[info] Reached --max-games cap ({args.max_games}). Stopping.")
-                break
-        completed = True
+            if args.max_games and kept_games + reserved_games >= args.max_games:
+                if executor is not None:
+                    submit_single_batch()
+                    drain_single_pending(wait_for_all=True)
+                if kept_games >= args.max_games:
+                    print(f"[info] Reached --max-games cap ({args.max_games}). Stopping.")
+                    scan_finished = True
+                    break
+        else:
+            scan_finished = True
+
+        if executor is not None:
+            submit_single_batch()
+            drain_single_pending(wait_for_all=True)
+        completed = scan_finished
 
     except KeyboardInterrupt:
-        print("\n[interrupted] Saving partial data and exiting...")
+        print(
+            "\n[interrupted] Saving completed batches and stopping pending workers...",
+            flush=True,
+        )
 
     finally:
-        # Ensure all buffered data is written
         try:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=not completed)
             writer.close(complete=completed)
         finally:
             text_stream.close()

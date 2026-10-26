@@ -1,46 +1,4 @@
-"""
-train.py — AlphaZero-Style Chess Network Training
-==================================================
-
-Trains a residual convolutional network on preprocessed HDF5 data produced by
-src.prepare_data. The network predicts both a move-policy distribution and a
-scalar board-value, following the AlphaZero architecture.
-
-Running Training
-----------------
-  python -m src.train --data data/processed/elo-1000-1099 --output-dir checkpoints/elo1000 --steps 50000
-  python -m src.train --data data/processed/elo-1200-1299 \
-      --fine-tune checkpoints/elo1000/checkpoint_step_50000.pt \
-      --replay-data data/processed/elo-1000-1099 --replay-ratio 0.25 \
-      --output-dir checkpoints/elo1200 --steps 20000
-  python -m src.train --data data/processed/elo-1000-1099 \
-      --resume checkpoints/elo1000/checkpoint_step_20000.pt \
-      --output-dir checkpoints/elo1000 --steps 50000
-
-The default model uses 8 residual blocks × 128 channels, squeeze-and-excitation
-in every block, and wider policy/value heads.
-
-`--resume` continues an interrupted run, including its optimizer and scheduler.
-`--fine-tune` starts a new stage from model weights with a fresh optimizer and
-learning-rate schedule. `--steps` is the total target for `--resume`, and the
-number of steps to run in a `--fine-tune` stage.
-
-Checkpoint Contents
--------------------
-  Each .pt file contains a dict with:
-    model     : model state_dict
-    optimizer : optimizer state_dict
-    scaler    : GradScaler state_dict (for mixed-precision)
-    step      : training step number (int)
-    config    : dict of all hyperparameters used
-
-Logging
--------
-  Metrics are logged to training.log (always), and additionally to:
-    - Weights & Biases (if `wandb` is installed)
-    - TensorBoard     (if `tensorboard` is installed and wandb is not)
-    - Console-only    (fallback)
-"""
+"""Train the ChessNet policy and value network."""
 
 import argparse
 import logging
@@ -72,10 +30,6 @@ from torch.utils.data import (
 )
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Logging Setup
-# ---------------------------------------------------------------------------
-
 def setup_logging(output_dir: str) -> logging.Logger:
     """Configure a logger that writes to both console and a local file."""
     logger = logging.getLogger("chess_train")
@@ -87,12 +41,10 @@ def setup_logging(output_dir: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    # File handler
     os.makedirs(output_dir, exist_ok=True)
     fh = logging.FileHandler(os.path.join(output_dir, "training.log"))
     fh.setFormatter(fmt)
@@ -101,10 +53,6 @@ def setup_logging(output_dir: str) -> logging.Logger:
     return logger
 
 
-# ---------------------------------------------------------------------------
-# Experiment Tracker (wandb > tensorboard > console)
-# ---------------------------------------------------------------------------
-
 class ExperimentTracker:
     """Thin wrapper that dispatches metric logging to wandb, TensorBoard, or nowhere."""
 
@@ -112,7 +60,6 @@ class ExperimentTracker:
         self.backend = "console"
         self._writer = None
 
-        # Try wandb first
         try:
             import wandb  # type: ignore
             wandb.init(project="chess-alphazero", config=config, dir=output_dir)
@@ -122,7 +69,6 @@ class ExperimentTracker:
         except Exception:
             pass
 
-        # Try TensorBoard
         try:
             from torch.utils.tensorboard import SummaryWriter  # type: ignore
             self._writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb_logs"))
@@ -145,10 +91,6 @@ class ExperimentTracker:
         elif self.backend == "tensorboard" and self._writer is not None:
             self._writer.close()
 
-
-# ---------------------------------------------------------------------------
-# Network Architecture
-# ---------------------------------------------------------------------------
 
 class ResidualBlock(nn.Module):
     """Residual block with optional squeeze-and-excitation channel attention."""
@@ -204,27 +146,22 @@ class ChessNet(nn.Module):
     ) -> None:
         super().__init__()
 
-        # --- Stem ---
         self.stem_conv = nn.Conv2d(18, channels, 3, padding=1, bias=False)
         self.stem_bn = nn.BatchNorm2d(channels)
 
-        # --- Residual tower ---
         self.tower = nn.Sequential(
             *[ResidualBlock(channels, use_se=use_se) for _ in range(num_blocks)]
         )
 
-        # --- Policy head ---
         self.policy_conv = nn.Conv2d(channels, policy_channels, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_fc = nn.Linear(policy_channels * 8 * 8, policy_size)
 
-        # --- Value head ---
         self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(value_channels)
         self.value_fc1 = nn.Linear(value_channels * 8 * 8, 256)
         self.value_fc2 = nn.Linear(256, 1)
 
-        # Initialize weights
         self._init_weights()
         # Start each residual branch close to identity for stable deeper training.
         for block in self.tower:
@@ -253,18 +190,14 @@ class ChessNet(nn.Module):
             policy_logits: (B, 4096) raw logits (no softmax).
             value:         (B, 1)    scalar value in [−1, +1].
         """
-        # Stem
         s = F.relu(self.stem_bn(self.stem_conv(x)))
 
-        # Residual tower
         t = self.tower(s)
 
-        # Policy head
         p = F.relu(self.policy_bn(self.policy_conv(t)))
         p = p.view(p.size(0), -1)
         policy_logits = self.policy_fc(p)  # (B, 4096)
 
-        # Value head
         v = F.relu(self.value_bn(self.value_conv(t)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.value_fc1(v))    # (B, 256)
@@ -277,10 +210,6 @@ class ChessNet(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
 class ChessDataset(Dataset):
     """Lazily-loaded HDF5 chess position dataset from one file or a folder.
 
@@ -289,11 +218,11 @@ class ChessDataset(Dataset):
         policy : int64 scalar  (move index, 0–4095)
         value  : float32 scalar (−1, 0, or +1)
 
-    For a folder, all complete ``*.h5`` files are concatenated in filename
+    For a folder, all accepted ``*.h5`` files are concatenated in filename
     order. Files are opened lazily so each DataLoader worker owns its handles.
     """
 
-    def __init__(self, hdf5_path: str) -> None:
+    def __init__(self, hdf5_path: str, allow_incomplete: bool = False) -> None:
         source = Path(hdf5_path)
         if source.is_dir():
             candidates = sorted(source.glob("*.h5"))
@@ -307,6 +236,7 @@ class ChessDataset(Dataset):
         self.hdf5_paths: list[Path] = []
         self.lengths: list[int] = []
         self.skipped_files: list[Path] = []
+        self.incomplete_files: list[Path] = []
         for candidate in candidates:
             try:
                 with h5py.File(candidate, "r") as f:
@@ -319,13 +249,19 @@ class ChessDataset(Dataset):
                             and f["values"].shape[0] == length
                         )
                     incomplete = complete is not None and not bool(complete)
-                    if incomplete or not valid_schema or length == 0:
+                    if (
+                        not valid_schema
+                        or length == 0
+                        or (incomplete and not allow_incomplete)
+                    ):
                         if source.is_dir():
                             self.skipped_files.append(candidate)
                             continue
                         raise ValueError(f"incomplete or empty chess dataset: {candidate}")
                     self.hdf5_paths.append(candidate)
                     self.lengths.append(length)
+                    if incomplete:
+                        self.incomplete_files.append(candidate)
             except OSError as exc:
                 if source.is_dir():
                     self.skipped_files.append(candidate)
@@ -333,7 +269,7 @@ class ChessDataset(Dataset):
                 raise ValueError(f"could not read chess dataset: {candidate}") from exc
 
         if not self.hdf5_paths:
-            raise ValueError(f"no complete, non-empty HDF5 datasets found in {source}")
+            raise ValueError(f"no usable, non-empty HDF5 datasets found in {source}")
 
         self._ends = np.cumsum(self.lengths)
         self._length = int(self._ends[-1])
@@ -365,10 +301,6 @@ class ChessDataset(Dataset):
         )
 
 
-# ---------------------------------------------------------------------------
-# Data Splitting
-# ---------------------------------------------------------------------------
-
 def make_data_loaders(
     dataset: ChessDataset,
     batch_size: int,
@@ -388,7 +320,7 @@ def make_data_loaders(
             raise ValueError("each training dataset must contain at least two positions")
         indices = np.arange(length)
         np.random.RandomState(seed).shuffle(indices)
-        val_size = min(max(1, int(0.02 * length)), length - 1)
+        val_size = min(max(1, int(0.20 * length)), length - 1)
         return indices[val_size:], indices[:val_size]
 
     train_indices, val_indices = split(len(dataset), seed=42)
@@ -453,10 +385,6 @@ def make_data_loaders(
     return train_loader, val_loader
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def validate(
     model: ChessNet,
@@ -493,15 +421,12 @@ def validate(
         total_policy_loss += p_loss.item()
         total_value_loss += v_loss.item()
 
-        # Top-1 accuracy
         pred_top1 = policy_logits.argmax(dim=1)
         total_top1 += (pred_top1 == policies).sum().item()
 
-        # Top-5 accuracy
         _, pred_top5 = policy_logits.topk(5, dim=1)
         total_top5 += (pred_top5 == policies.unsqueeze(1)).any(dim=1).sum().item()
 
-        # Value MAE
         total_value_ae += (value_pred.squeeze(1) - values.squeeze(1)).abs().sum().item()
 
         total_samples += batch_n
@@ -521,10 +446,6 @@ def validate(
     model.train()
     return metrics
 
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
 
 def save_checkpoint(
     path: str,
@@ -662,19 +583,11 @@ def load_checkpoint(
     return step
 
 
-# ---------------------------------------------------------------------------
-# Infinite DataLoader Iterator
-# ---------------------------------------------------------------------------
-
 def infinite_loader(loader: DataLoader):
     """Yield batches from *loader* in an infinite loop (for step-based training)."""
     while True:
         yield from loader
 
-
-# ---------------------------------------------------------------------------
-# Main Training Loop
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -685,7 +598,10 @@ def main() -> None:
         "--output-dir", default=None,
         help="Checkpoint directory (defaults to checkpoints or a source-specific fine-tune folder)",
     )
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--batch-size", type=int, default=512,
+        help="Positions per optimizer step (default: 512; raise to use more GPU capacity)",
+    )
     parser.add_argument(
         "--steps", type=int, default=500_000,
         help="Total target for --resume; number of steps for a new/fine-tune run",
@@ -704,7 +620,15 @@ def main() -> None:
         "--no-se", action="store_true", default=None,
         help="Disable squeeze-and-excitation blocks",
     )
-    parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="DataLoader subprocesses (default: 0, keeping training in one process)",
+    )
+    parser.add_argument(
+        "--allow-incomplete-data",
+        action="store_true",
+        help="Train on non-empty HDF5 files marked incomplete after an interrupted parse",
+    )
     run_mode = parser.add_mutually_exclusive_group()
     run_mode.add_argument(
         "--resume", type=str, default=None,
@@ -782,9 +706,9 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logging(args.output_dir)
 
-    # Build config dict (stored in every checkpoint)
     config: Dict[str, Any] = {
         "data": args.data,
+        "allow_incomplete_data": args.allow_incomplete_data,
         "batch_size": args.batch_size,
         "steps": args.steps,
         "blocks": args.blocks,
@@ -800,7 +724,6 @@ def main() -> None:
         "replay_ratio": args.replay_ratio if args.replay_data else 0.0,
     }
 
-    # ---- Device ----
     # is_available() checks both that this PyTorch build has CUDA support and
     # that a usable CUDA device/driver is visible to the process.
     if torch.cuda.is_available():
@@ -821,8 +744,7 @@ def main() -> None:
                 "detected; using CPU. Check GPU/driver visibility."
             )
 
-    # ---- Dataset ----
-    dataset = ChessDataset(args.data)
+    dataset = ChessDataset(args.data, allow_incomplete=args.allow_incomplete_data)
     config["data_files"] = [str(path.resolve()) for path in dataset.hdf5_paths]
     logger.info(f"Dataset: {len(dataset):,} positions from {args.data}")
     if len(dataset.hdf5_paths) > 1:
@@ -832,10 +754,17 @@ def main() -> None:
             "Ignored incomplete or empty HDF5 files: "
             + ", ".join(str(path) for path in dataset.skipped_files)
         )
+    if dataset.incomplete_files:
+        logger.warning(
+            "Using partial HDF5 files saved by an interrupted parse: "
+            + ", ".join(str(path) for path in dataset.incomplete_files)
+        )
 
     replay_dataset = None
     if args.replay_data:
-        replay_dataset = ChessDataset(args.replay_data)
+        replay_dataset = ChessDataset(
+            args.replay_data, allow_incomplete=args.allow_incomplete_data
+        )
         logger.info(
             f"Replay dataset: {len(replay_dataset):,} positions from {args.replay_data} "
             f"({args.replay_ratio:.0%} of sampled training positions)"
@@ -844,6 +773,11 @@ def main() -> None:
             logger.warning(
                 "Ignored incomplete or empty replay files: "
                 + ", ".join(str(path) for path in replay_dataset.skipped_files)
+            )
+        if replay_dataset.incomplete_files:
+            logger.warning(
+                "Using partial replay HDF5 files saved by an interrupted parse: "
+                + ", ".join(str(path) for path in replay_dataset.incomplete_files)
             )
 
     train_loader, val_loader = make_data_loaders(
@@ -855,9 +789,8 @@ def main() -> None:
     )
     val_size = max(1, int(0.02 * len(dataset)))
     train_size = len(dataset) - val_size
-    logger.info(f"Split: {train_size:,} train / {val_size:,} val (98/2)")
+    logger.info(f"Split: {train_size:,} train / {val_size:,} val (80/20)")
 
-    # ---- Model ----
     model = ChessNet(
         channels=args.channels,
         num_blocks=args.blocks,
@@ -878,7 +811,6 @@ def main() -> None:
         f"SE={args.use_se}, {model.count_parameters():,} parameters"
     )
 
-    # ---- Optimizer & Scheduler ----
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr"],
@@ -889,7 +821,6 @@ def main() -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ---- Resume ----
     start_step = 0
     if args.resume:
         start_step = load_checkpoint(
@@ -909,11 +840,9 @@ def main() -> None:
             )
         logger.info(f"Resumed from {args.resume} at step {start_step:,}")
 
-    # ---- Experiment Tracker ----
     tracker = ExperimentTracker(config, args.output_dir)
     logger.info(f"Logging backend: {tracker.backend}")
 
-    # ---- Training ----
     logger.info(f"Starting training for {args.steps:,} steps (batch_size={args.batch_size})")
     model.train()
 
@@ -939,18 +868,15 @@ def main() -> None:
             policies = policies.to(device, non_blocking=True)
             values = values.to(device, non_blocking=True).unsqueeze(1)  # (B,) → (B,1)
 
-            # Forward pass with mixed precision
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 policy_logits, value_pred = model(boards)
                 policy_loss = F.cross_entropy(policy_logits, policies)
                 value_loss = F.mse_loss(value_pred, values)
                 total_loss = policy_loss + value_loss
 
-            # Backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(total_loss).backward()
 
-            # Unscale before clipping to get true gradient norms
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -960,7 +886,6 @@ def main() -> None:
 
             step += 1
 
-            # --- Logging (every 100 steps) ---
             if step % 100 == 0:
                 elapsed = time.time() - batch_time
                 samples_per_sec = samples_since_log / max(elapsed, 1e-6)
@@ -985,7 +910,6 @@ def main() -> None:
                 batch_time = time.time()
                 samples_since_log = 0
 
-            # --- Validation (every 5,000 steps) ---
             if step % 5_000 == 0:
                 val_metrics = validate(model, val_loader, device)
                 tracker.log(val_metrics, step)
@@ -998,7 +922,6 @@ def main() -> None:
                     f"v_mae={val_metrics['value_mae']:.4f}"
                 )
 
-            # --- Checkpoint (every 10,000 steps) ---
             if step % 10_000 == 0:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, scaler, step, config, scheduler)
@@ -1022,7 +945,6 @@ def main() -> None:
     if interrupted:
         logger.info("Training interrupted; the emergency checkpoint is the retained model.")
     else:
-        # --- Final checkpoint ---
         final_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
         if not os.path.exists(final_path):
             save_checkpoint(final_path, model, optimizer, scaler, step, config, scheduler)

@@ -187,7 +187,7 @@ h1 { margin-bottom: 7px; color: #26362d; font: 500 clamp(27px, 2.25vw, 34px)/1.1
 .clock-box.is-running .clock-icon { color: #d5e0d0; }
 .clock-box.is-low { border-color: var(--red); color: #fffaf4; background: var(--red); }
 .board-frame { position: relative; margin: 2px 0 3px; padding: 8px 8px 22px 22px; border: 1px solid #263a2d; background: #304839; }
-.board { position: relative; display: grid; width: 100%; aspect-ratio: 1; grid-template-columns: repeat(8, minmax(0, 1fr)); grid-template-rows: repeat(8, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); gap: 0; overflow: hidden; border: 1px solid rgba(31, 45, 34, .55); background: var(--board-light); touch-action: manipulation; }
+.board { position: relative; display: grid; width: 100%; aspect-ratio: 1; grid-template-columns: repeat(8, minmax(0, 1fr)); grid-template-rows: repeat(8, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); gap: 0; overflow: hidden; border: 1px solid rgba(31, 45, 34, .55); background: var(--board-light); touch-action: none; }
 .square { position: relative; display: grid; width: 100%; height: 100%; min-width: 0; min-height: 0; place-items: center; appearance: none; margin: 0; padding: 0; border: 0; outline: none; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .square.light { background: var(--board-light); }
 .square.dark { background: var(--board-dark); }
@@ -198,9 +198,11 @@ h1 { margin-bottom: 7px; color: #26362d; font: 500 clamp(27px, 2.25vw, 34px)/1.1
 .square.legal-empty::before { position: absolute; z-index: 2; width: 22%; height: 22%; border-radius: 50%; background: rgba(34, 49, 37, .35); content: ""; pointer-events: none; }
 .square.legal-capture::before { position: absolute; z-index: 2; border: 4px solid rgba(34, 49, 37, .32); border-radius: 50%; content: ""; inset: 5%; pointer-events: none; }
 .square:hover::before { filter: brightness(.72); }
-.piece { position: relative; z-index: 3; display: block; font-family: "DejaVu Sans", "Segoe UI Symbol", "Noto Sans Symbols 2", "Arial Unicode MS", serif; font-size: clamp(29px, 5.35vw, 66px); line-height: 1; user-select: none; }
-.piece-white { color: #fffdf2; -webkit-text-stroke: 1px #536b50; paint-order: stroke fill; text-shadow: 0 1px 1px rgba(34, 49, 37, .22); }
-.piece-black { color: #26332a; -webkit-text-stroke: .5px #f2efdb; paint-order: stroke fill; text-shadow: 0 1px 1px rgba(255, 255, 255, .22); }
+.piece-svg { position: relative; z-index: 3; display: block; width: 82%; height: 82%; object-fit: contain; user-select: none; pointer-events: none; }
+.piece-svg.is-drag-source { opacity: .22; }
+.piece-drag-ghost { position: fixed !important; z-index: 20 !important; top: 0; left: 0; margin: 0; opacity: .96; pointer-events: none; will-change: transform; filter: drop-shadow(0 7px 6px rgba(20, 30, 22, .28)); }
+.board.is-dragging, .board.is-dragging .square { cursor: grabbing; }
+.opponent-avatar img, .self-avatar img { display: block; width: 82%; height: 82%; object-fit: contain; }
 .board-coordinates { position: absolute; color: #dfd0a8; font: 700 9px/1 ui-sans-serif, system-ui, sans-serif; }
 .board-coordinates-left { top: 8px; bottom: 22px; left: 4px; display: grid; width: 13px; grid-template-rows: repeat(8, 1fr); align-items: center; justify-items: center; }
 .board-coordinates-bottom { right: 8px; bottom: 4px; left: 22px; display: grid; grid-template-columns: repeat(8, 1fr); justify-items: center; }
@@ -362,7 +364,7 @@ body.soft-contrast .clock-box.is-running { background: #2e4738; }
   .board-coordinates-left { top: 7px; bottom: 20px; }
   .board-coordinates-bottom { right: 7px; left: 20px; }
   .board-sheen { inset: 7px 7px 20px 20px; }
-  .piece { font-size: clamp(27px, 8.5vw, 55px); }
+  .piece-svg { width: 84%; height: 84%; }
   .game-panel { padding-top: 15px; }
   .panel-actions { max-width: 420px; }
   .game-footnote { display: none; }
@@ -391,7 +393,7 @@ body.soft-contrast .clock-box.is-running { background: #2e4738; }
   .board-coordinates-left { top: 6px; bottom: 18px; left: 3px; width: 12px; }
   .board-coordinates-bottom { right: 6px; bottom: 3px; left: 18px; }
   .board-sheen { inset: 6px 6px 18px 18px; }
-  .piece { font-size: clamp(25px, 9.4vw, 42px); }
+  .piece-svg { width: 84%; height: 84%; }
   .opponent-avatar, .self-avatar { width: 28px; height: 28px; }
   .person-block { gap: 7px; }
   .person-name { font-size: 11px; }

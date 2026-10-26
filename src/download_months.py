@@ -1,12 +1,4 @@
-"""Download each monthly Lichess archive once and build all Elo bands locally.
-
-Example:
-    python -m src.download_months --year 2024
-
-Each month is processed in order. Its compressed archive is kept in
-``data/processed/.archives`` until all six Elo-band files are complete, so a
-rerun can resume a partial download or reuse an already downloaded archive.
-"""
+"""Download monthly Lichess archives and prepare Elo-band datasets."""
 
 from __future__ import annotations
 
@@ -14,11 +6,10 @@ import argparse
 import json
 import os
 import re
-import subprocess
-import sys
+import signal
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import h5py
@@ -26,7 +17,17 @@ import requests
 from tqdm import tqdm
 
 from .paths import PROJECT_ROOT
-from .prepare_data import DEFAULT_ELO_SAMPLE_RATES, ELO_BANDS, LICHESS_URL
+from .prepare_data import (
+    DEFAULT_ELO_SAMPLE_RATES,
+    ELO_BANDS,
+    LICHESS_URL,
+    available_cpu_count,
+    prepare_elo_bands,
+)
+
+
+def _handle_sigterm(_signum, _frame) -> None:
+    raise KeyboardInterrupt
 
 
 def file_matches_request(
@@ -322,6 +323,7 @@ def _download_archive_parallel(
 
         metadata_lock = threading.Lock()
         fallback_write_lock = threading.Lock()
+        stop_download = threading.Event()
         completed = _merge_ranges(completed)
         completed_bytes = sum(end - start + 1 for start, end in completed)
         ranges = _missing_ranges(total_bytes, chunk_bytes, completed)
@@ -349,6 +351,8 @@ def _download_archive_parallel(
         def download_range(start: int, end: int, progress: tqdm) -> None:
             expected_bytes = end - start + 1
             for attempt in range(1, retries + 1):
+                if stop_download.is_set():
+                    return
                 response = None
                 received = 0
                 try:
@@ -377,6 +381,10 @@ def _download_archive_parallel(
                         )
 
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if stop_download.is_set():
+                            if received:
+                                progress.update(-received)
+                            return
                         if not chunk:
                             continue
                         if received + len(chunk) > expected_bytes:
@@ -420,7 +428,6 @@ def _download_archive_parallel(
                     if response is not None:
                         response.close()
 
-        errors: list[BaseException] = []
         with tqdm(
             total=total_bytes,
             initial=completed_bytes,
@@ -430,21 +437,23 @@ def _download_archive_parallel(
             unit_divisor=1024,
             dynamic_ncols=True,
         ) as progress:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            futures = []
+            try:
                 futures = [
                     executor.submit(download_range, start, end, progress)
                     for start, end in ranges
                 ]
                 for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except BaseException as exc:
-                        errors.append(exc)
-
-        if errors:
-            raise RuntimeError(
-                f"could not finish parallel download of {month}: {errors[0]}"
-            ) from errors[0]
+                    future.result()
+            except BaseException:
+                stop_download.set()
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
 
         completed_bytes = sum(end - start + 1 for start, end in _merge_ranges(completed))
         if completed_bytes != total_bytes:
@@ -553,58 +562,45 @@ def prepare_month(
     output_root: Path,
     max_games: int | None,
     sample_rates: dict[tuple[int, int], float],
+    workers: int,
     overwrite: bool,
 ) -> int:
     """Parse the local archive into all Elo bands, showing its live progress."""
-    command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "src.prepare_data",
-        "--month",
-        month,
-        "--archive",
-        str(archive_path),
-        "--all-elo-bands",
-        "--output-dir",
-        str(output_root),
-    ]
-    if max_games is not None:
-        command.extend(["--max-games", str(max_games)])
-    command.extend([
-        "--sample-rate-2200-2500",
-        str(sample_rates[(2200, 2500)]),
-        "--sample-rate-2500-2700",
-        str(sample_rates[(2500, 2700)]),
-    ])
-    if overwrite:
-        command.append("--overwrite")
-
     print(f"\n[parse] {month}: building all Elo bands from {archive_path}", flush=True)
-    return subprocess.run(command, cwd=PROJECT_ROOT, check=False).returncode
+    prepare_elo_bands(
+        month,
+        archive_path,
+        output_root,
+        max_games=max_games,
+        sample_rates=sample_rates,
+        workers=workers,
+        overwrite=overwrite,
+    )
+    return 0
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser(
         description=(
             "Download monthly Lichess archives one at a time and parse each "
-            "into six Elo-band datasets."
+            "into four Elo-band datasets (up to 2200 Elo)."
         )
     )
     parser.add_argument("--year", type=int, required=True, help="Year to process, e.g. 2024")
     parser.add_argument("--start-month", type=int, default=1, help="First month (1-12)")
     parser.add_argument("--end-month", type=int, default=12, help="Last month (1-12)")
     parser.add_argument(
+        "--month-count", type=int, default=None,
+        help="Process at most this many months from the selected range (for example, 1)",
+    )
+    parser.add_argument(
         "--max-games", type=int, default=None,
         help="Optional cap per Elo band per month; by default process every qualifying game",
     )
     parser.add_argument(
-        "--sample-rate-2200-2500", type=float, default=0.1,
-        help="Fraction of eligible 2200-2500 games to retain (default: 0.1)",
-    )
-    parser.add_argument(
-        "--sample-rate-2500-2700", type=float, default=0.05,
-        help="Fraction of eligible 2500-2700 games to retain (default: 0.05)",
+        "--workers", type=int, default=available_cpu_count(),
+        help=f"CPU worker processes for game encoding (default: {available_cpu_count()})",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=None,
@@ -636,12 +632,12 @@ def main() -> None:
         parser.error("--start-month and --end-month must be from 1 through 12")
     if args.start_month > args.end_month:
         parser.error("--start-month must not be after --end-month")
+    if args.month_count is not None and args.month_count < 1:
+        parser.error("--month-count must be positive")
     if args.max_games is not None and args.max_games < 1:
         parser.error("--max-games must be positive")
-    if not 0.0 < args.sample_rate_2200_2500 <= 1.0:
-        parser.error("--sample-rate-2200-2500 must be greater than 0 and at most 1")
-    if not 0.0 < args.sample_rate_2500_2700 <= 1.0:
-        parser.error("--sample-rate-2500-2700 must be greater than 0 and at most 1")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
     if args.download_retries < 1:
         parser.error("--download-retries must be positive")
     if args.download_connections < 1:
@@ -655,21 +651,27 @@ def main() -> None:
     archive_dir = archive_dir.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Controller PID: {os.getpid()}", flush=True)
 
     months = [
         f"{args.year}-{number:02d}"
         for number in range(args.start_month, args.end_month + 1)
     ]
+    if args.month_count is not None:
+        months = months[:args.month_count]
     print(f"Writing Elo-band datasets under: {output_root}", flush=True)
     print(f"Temporary monthly archives: {archive_dir}", flush=True)
     print(f"Elo bands: {', '.join(f'{low}-{high}' for low, high in ELO_BANDS)}", flush=True)
-    print(f"Months: {months[0]} through {months[-1]} (one month at a time)", flush=True)
+    print(
+        f"Months: {months[0]} through {months[-1]} ({len(months)} month(s); "
+        "next archive downloads during parsing)",
+        flush=True,
+    )
+    print(f"CPU encoding workers: {args.workers}", flush=True)
 
     completed_months = 0
     failures: list[str] = []
     sample_rates = DEFAULT_ELO_SAMPLE_RATES.copy()
-    sample_rates[(2200, 2500)] = args.sample_rate_2200_2500
-    sample_rates[(2500, 2700)] = args.sample_rate_2500_2700
     print(
         "Game sample rates: "
         + ", ".join(
@@ -678,60 +680,102 @@ def main() -> None:
         ),
         flush=True,
     )
-    for month in months:
+
+    def archive_paths(month: str) -> tuple[Path, Path, Path]:
         archive_path = archive_dir / f"lichess_db_standard_rated_{month}.pgn.zst"
         partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
         metadata_path = partial_path.with_name(partial_path.name + ".ranges.json")
-        if not args.overwrite and month_is_complete(
-            output_root, month, args.max_games, sample_rates
-        ):
-            archive_path.unlink(missing_ok=True)
-            partial_path.unlink(missing_ok=True)
-            metadata_path.unlink(missing_ok=True)
-            print(f"[skip] All band files for {month} are already complete", flush=True)
-            completed_months += 1
-            continue
+        return archive_path, partial_path, metadata_path
 
-        try:
-            download_archive(
-                month,
-                archive_path,
-                args.download_retries,
-                args.download_connections,
-                args.download_chunk_mb * 1024 * 1024,
-            )
-            return_code = prepare_month(
-                month,
-                archive_path,
-                output_root,
-                args.max_games,
-                sample_rates,
-                args.overwrite,
-            )
-            if return_code != 0:
-                failures.append(f"{month} (prepare_data.py exited {return_code})")
-                print(f"[failed] {month}; archive retained for rerun", flush=True)
-                break
+    def download_month_archive(month: str) -> Path:
+        archive_path, _, _ = archive_paths(month)
+        return download_archive(
+            month,
+            archive_path,
+            args.download_retries,
+            args.download_connections,
+            args.download_chunk_mb * 1024 * 1024,
+        )
 
-            if not month_is_complete(
+    def cleanup_archive(month: str) -> None:
+        archive_path, partial_path, metadata_path = archive_paths(month)
+        archive_path.unlink(missing_ok=True)
+        partial_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+
+    download_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="month-download")
+    pending_download: tuple[str, Future[Path]] | None = None
+    try:
+        for index, month in enumerate(months):
+            archive_path, _, _ = archive_paths(month)
+            if not args.overwrite and month_is_complete(
                 output_root, month, args.max_games, sample_rates
             ):
-                failures.append(f"{month} (one or more Elo-band files are incomplete)")
-                print(f"[failed] {month}; archive retained for rerun", flush=True)
-                break
+                cleanup_archive(month)
+                print(f"[skip] All band files for {month} are already complete", flush=True)
+                completed_months += 1
+                continue
 
-            archive_path.unlink(missing_ok=True)
-            partial_path.unlink(missing_ok=True)
-            metadata_path.unlink(missing_ok=True)
-            completed_months += 1
-            print(f"[done] {month}: all Elo bands complete; archive removed", flush=True)
-        except (OSError, RuntimeError, requests.RequestException) as exc:
-            failures.append(f"{month} ({exc})")
-            print(f"[failed] {month}; archive/partial download retained for rerun", flush=True)
-            break
-        except KeyboardInterrupt:
-            print("\nInterrupted. The current archive and completed band files are retained.", flush=True)
-            raise SystemExit(130)
+            try:
+                if pending_download is not None and pending_download[0] == month:
+                    pending_download[1].result()
+                    pending_download = None
+                else:
+                    download_month_archive(month)
+
+                # Start fetching the next needed month while this one is parsed.
+                next_month = next(
+                    (
+                        candidate
+                        for candidate in months[index + 1:]
+                        if args.overwrite
+                        or not month_is_complete(
+                            output_root, candidate, args.max_games, sample_rates
+                        )
+                    ),
+                    None,
+                )
+                if next_month is not None:
+                    pending_download = (
+                        next_month,
+                        download_pool.submit(download_month_archive, next_month),
+                    )
+
+                return_code = prepare_month(
+                    month,
+                    archive_path,
+                    output_root,
+                    args.max_games,
+                    sample_rates,
+                    args.workers,
+                    args.overwrite,
+                )
+                if return_code != 0:
+                    failures.append(f"{month} (prepare_data.py exited {return_code})")
+                    print(f"[failed] {month}; archive retained for rerun", flush=True)
+                    break
+
+                if not month_is_complete(
+                    output_root, month, args.max_games, sample_rates
+                ):
+                    failures.append(f"{month} (one or more Elo-band files are incomplete)")
+                    print(f"[failed] {month}; archive retained for rerun", flush=True)
+                    break
+
+                cleanup_archive(month)
+                completed_months += 1
+                print(f"[done] {month}: all Elo bands complete; archive removed", flush=True)
+            except (OSError, RuntimeError, requests.RequestException) as exc:
+                failures.append(f"{month} ({exc})")
+                print(f"[failed] {month}; archive/partial download retained for rerun", flush=True)
+                break
+            except KeyboardInterrupt:
+                print("\nInterrupted. The current archive and completed band files are retained.", flush=True)
+                raise SystemExit(130)
+    finally:
+        if pending_download is not None:
+            pending_download[1].cancel()
+        download_pool.shutdown(wait=True, cancel_futures=True)
 
     print(f"\nFinished: {completed_months}/{len(months)} months complete.")
     if failures:

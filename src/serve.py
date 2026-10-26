@@ -1,11 +1,4 @@
-"""Serve Whisker and connect its local board API to ChessNet.
-
-Run with:
-    python -m src.serve --checkpoint checkpoints/path/to/checkpoint.pt
-
-The page can also be opened without an installed model. In that case it stays
-in preview mode until a trained checkpoint is supplied.
-"""
+"""Serve the Whisker web app and local ChessNet API."""
 
 from __future__ import annotations
 
@@ -29,9 +22,23 @@ STATIC_FILES = {
     "/index.html": (WEB_ROOT / "index.html", "text/html; charset=utf-8"),
     "/styles.css": (WEB_ROOT / "styles.css", "text/css; charset=utf-8"),
     "/app.js": (WEB_ROOT / "app.js", "text/javascript; charset=utf-8"),
-    "/audio/move.wav": (WEB_ROOT / "audio" / "move.wav", "audio/wav"),
-    "/audio/capture.wav": (WEB_ROOT / "audio" / "capture.wav", "audio/wav"),
 }
+for color in ("white", "black"):
+    for piece in ("pawn", "rook", "knight", "bishop", "queen", "king"):
+        filename = f"{color}_{piece}.svg"
+        STATIC_FILES[f"/assets/pieces/cburnett/{filename}"] = (
+            WEB_ROOT / "assets" / "pieces" / "cburnett" / filename,
+            "image/svg+xml; charset=utf-8",
+        )
+    STATIC_FILES[f"/assets/pieces/wintrchess/standard/{color}_king.svg"] = (
+        WEB_ROOT / "assets" / "pieces" / "wintrchess" / "standard" / f"{color}_king.svg",
+        "image/svg+xml; charset=utf-8",
+    )
+for sound in ("move", "capture", "castle", "check", "promote", "gameend"):
+    STATIC_FILES[f"/assets/audio/{sound}.mp3"] = (
+        WEB_ROOT / "assets" / "audio" / f"{sound}.mp3",
+        "audio/mpeg",
+    )
 TIME_CONTROLS = {
     "bullet": {(1, 0), (2, 1)},
     "blitz": {(3, 0), (5, 0), (5, 3)},
@@ -165,6 +172,7 @@ class ChessApp:
 
         tag_names = ("Event", "Site", "Date", "Round", "White", "Black", "Result", "ECO")
         headers = {name: game.headers.get(name, "") for name in tag_names}
+        frames[-1]["game_over"] = headers["Result"] not in ("", "*", "?")
         return {"study": {"headers": headers, "history": history, "frames": frames}}
 
     def _study_position(self, board: Any, last_move: str | None = None) -> dict[str, Any]:

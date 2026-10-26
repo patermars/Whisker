@@ -1,9 +1,4 @@
-"""Small UCI adapter for the ChessNet policy network.
-
-This engine selects the highest-scoring legal move from the policy head. It
-does not search ahead, so its playing strength is limited by the trained
-network and its inference speed.
-"""
+"""UCI adapter for the ChessNet policy network."""
 
 from __future__ import annotations
 
