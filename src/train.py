@@ -3,17 +3,17 @@ train.py — AlphaZero-Style Chess Network Training
 ==================================================
 
 Trains a residual convolutional network on preprocessed HDF5 data produced by
-whisker.prepare_data. The network predicts both a move-policy distribution and a
+src.prepare_data. The network predicts both a move-policy distribution and a
 scalar board-value, following the AlphaZero architecture.
 
 Running Training
 ----------------
-  python -m whisker.train --data data/processed/elo-1000-1099 --output-dir checkpoints/elo1000 --steps 50000
-  python -m whisker.train --data data/processed/elo-1200-1299 \
+  python -m src.train --data data/processed/elo-1000-1099 --output-dir checkpoints/elo1000 --steps 50000
+  python -m src.train --data data/processed/elo-1200-1299 \
       --fine-tune checkpoints/elo1000/checkpoint_step_50000.pt \
       --replay-data data/processed/elo-1000-1099 --replay-ratio 0.25 \
       --output-dir checkpoints/elo1200 --steps 20000
-  python -m whisker.train --data data/processed/elo-1000-1099 \
+  python -m src.train --data data/processed/elo-1000-1099 \
       --resume checkpoints/elo1000/checkpoint_step_20000.pt \
       --output-dir checkpoints/elo1000 --steps 50000
 
@@ -50,6 +50,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+# Training uses PyTorch's built-in CPU/CUDA backends. Skip optional third-party
+# backend discovery by default so an unreadable entry_points.txt in any installed
+# package cannot prevent torch from importing. Set this to 1 before launching
+# training when an out-of-tree device backend plugin is required.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import h5py
 import numpy as np
@@ -542,6 +548,22 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
+def retain_only_checkpoint(
+    output_dir: str,
+    keep_path: str,
+    logger: logging.Logger,
+) -> None:
+    """Delete older step checkpoints after a newer checkpoint is safely saved."""
+    keep = Path(keep_path).resolve()
+    for candidate in Path(output_dir).glob("checkpoint_step_*.pt"):
+        if candidate.resolve() == keep:
+            continue
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove old checkpoint %s: %s", candidate, exc)
+
+
 def read_model_state(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
     """Read and normalize model weights from a training checkpoint or state dict."""
     payload = torch.load(path, map_location=device, weights_only=False)
@@ -779,10 +801,25 @@ def main() -> None:
     }
 
     # ---- Device ----
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-    if device.type == "cuda":
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+    # is_available() checks both that this PyTorch build has CUDA support and
+    # that a usable CUDA device/driver is visible to the process.
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        logger.info("Device: %s", device)
+        logger.info("GPU: %s", torch.cuda.get_device_name(device))
+    else:
+        device = torch.device("cpu")
+        logger.info("Device: %s", device)
+        if not torch.backends.cuda.is_built():
+            logger.warning(
+                "CUDA is unavailable because this PyTorch installation was "
+                "built without CUDA support; using CPU."
+            )
+        else:
+            logger.warning(
+                "This PyTorch build supports CUDA, but no usable CUDA GPU was "
+                "detected; using CPU. Check GPU/driver visibility."
+            )
 
     # ---- Dataset ----
     dataset = ChessDataset(args.data)
@@ -884,6 +921,7 @@ def main() -> None:
     step = start_step
     batch_time = time.time()
     samples_since_log = 0
+    interrupted = False
 
     pbar = tqdm(
         initial=start_step,
@@ -964,27 +1002,33 @@ def main() -> None:
             if step % 10_000 == 0:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, scaler, step, config, scheduler)
+                retain_only_checkpoint(args.output_dir, ckpt_path, logger)
                 logger.info(f"[CKPT] Saved {ckpt_path}")
 
             pbar.update(1)
 
     except KeyboardInterrupt:
+        interrupted = True
         logger.info("Interrupted — saving emergency checkpoint...")
         ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}_emergency.pt")
         save_checkpoint(ckpt_path, model, optimizer, scaler, step, config, scheduler)
+        retain_only_checkpoint(args.output_dir, ckpt_path, logger)
         logger.info(f"Emergency checkpoint saved: {ckpt_path}")
 
     finally:
         pbar.close()
         tracker.close()
 
-    # --- Final checkpoint ---
-    final_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
-    if not os.path.exists(final_path):
-        save_checkpoint(final_path, model, optimizer, scaler, step, config, scheduler)
+    if interrupted:
+        logger.info("Training interrupted; the emergency checkpoint is the retained model.")
+    else:
+        # --- Final checkpoint ---
+        final_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
+        if not os.path.exists(final_path):
+            save_checkpoint(final_path, model, optimizer, scaler, step, config, scheduler)
+        retain_only_checkpoint(args.output_dir, final_path, logger)
         logger.info(f"Final checkpoint: {final_path}")
-
-    logger.info("Training complete.")
+        logger.info("Training complete.")
 
 
 if __name__ == "__main__":

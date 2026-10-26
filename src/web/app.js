@@ -31,6 +31,18 @@ const ui = {
   selected: null,
   flipped: false,
   busy: false,
+  animating: false,
+  animationTimer: null,
+  moveTimeouts: [],
+  soundEnabled: true,
+  audioContext: null,
+  audioBuffers: null,
+  audioUnlockPromise: null,
+  audioLoadFailed: false,
+  pendingMove: null,
+  startingGame: false,
+  studyGame: null,
+  studyTimer: null,
   toastTimer: null,
 };
 
@@ -62,7 +74,7 @@ function renderModeControls() {
   document.querySelectorAll(".mode-tab").forEach((button) => {
     const selected = button.dataset.mode === ui.mode;
     button.classList.toggle("is-selected", selected);
-    button.setAttribute("aria-selected", String(selected));
+    button.setAttribute("aria-pressed", String(selected));
     button.disabled = locked;
   });
   const options = $("#time-options");
@@ -86,8 +98,129 @@ function sameControl(a, b) {
   return a.minutes === b.minutes && a.increment === b.increment;
 }
 
-function renderBoard() {
-  const state = ui.state || initialPreview();
+function parseUciMove(uci) {
+  if (typeof uci !== "string" || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) return null;
+  return { from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || null };
+}
+
+function unlockAudio() {
+  if (!ui.soundEnabled) return Promise.resolve(false);
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return Promise.resolve(false);
+  if (!ui.audioContext) {
+    try {
+      ui.audioContext = new AudioContextClass();
+    } catch {
+      return Promise.resolve(false);
+    }
+  }
+  if (ui.audioContext.state === "running" && ui.audioBuffers) return Promise.resolve(true);
+  if (ui.audioUnlockPromise) return ui.audioUnlockPromise;
+  const audioContext = ui.audioContext;
+  ui.audioUnlockPromise = audioContext.resume().then(async () => {
+    if (!ui.audioBuffers) {
+      const entries = await Promise.all(Object.entries({
+        move: "/audio/move.wav",
+        capture: "/audio/capture.wav",
+      }).map(async ([name, url]) => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Could not load ${name} sound (${response.status}).`);
+        const buffer = await response.arrayBuffer();
+        return [name, await audioContext.decodeAudioData(buffer)];
+      }));
+      ui.audioBuffers = Object.fromEntries(entries);
+    }
+    return audioContext.state === "running";
+  }).catch((error) => {
+    if (!ui.audioLoadFailed) {
+      ui.audioLoadFailed = true;
+      console.error("Whisker could not load move sounds.", error);
+      showToast("Move sounds could not load. Check the local server and try again.");
+    }
+    return false;
+  }).finally(() => {
+    ui.audioUnlockPromise = null;
+  });
+  return ui.audioUnlockPromise;
+}
+
+function playMoveSound(capture = false) {
+  if (!ui.soundEnabled) return;
+  const play = () => {
+    const audioContext = ui.audioContext;
+    const buffer = ui.audioBuffers?.[capture ? "capture" : "move"];
+    if (!audioContext || audioContext.state !== "running" || !buffer) return false;
+    const source = audioContext.createBufferSource();
+    const compressor = audioContext.createDynamicsCompressor();
+    const gain = audioContext.createGain();
+    compressor.threshold.value = -18;
+    compressor.knee.value = 18;
+    compressor.ratio.value = 4;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.12;
+    gain.gain.value = 2.2;
+    source.buffer = buffer;
+    source.connect(compressor);
+    compressor.connect(gain);
+    gain.connect(audioContext.destination);
+    source.start();
+    return true;
+  };
+  if (!play()) {
+    void unlockAudio().then(() => {
+      if (ui.soundEnabled) play();
+    });
+  }
+}
+
+function animateBoardMoves(moves, previousState) {
+  if (!moves.length) return;
+  const board = $("#chessboard");
+  const pieces = { ...(previousState?.pieces || {}) };
+  const reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+  moves.forEach((move, index) => {
+    const timeout = window.setTimeout(() => {
+      ui.moveTimeouts = ui.moveTimeouts.filter((id) => id !== timeout);
+      const movingPiece = pieces[move.from];
+      const targetPiece = pieces[move.to];
+      const isEnPassant = movingPiece?.type === "p" && move.from[0] !== move.to[0] && !targetPiece;
+      const captured = Boolean(targetPiece) || isEnPassant;
+      const destination = board.querySelector(`[data-square="${move.to}"] .piece`);
+      const sourceSquare = board.querySelector(`[data-square="${move.from}"]`);
+      const targetSquare = board.querySelector(`[data-square="${move.to}"]`);
+
+      if (!reducedMotion && destination && sourceSquare && targetSquare && typeof destination.animate === "function") {
+        const sourceRect = sourceSquare.getBoundingClientRect();
+        const targetRect = targetSquare.getBoundingClientRect();
+        destination.animate([
+          { transform: `translate(${sourceRect.left - targetRect.left}px, ${sourceRect.top - targetRect.top}px) scale(.92)` },
+          { transform: "translate(0, 0) scale(1)" },
+        ], { duration: 230, easing: "cubic-bezier(.2, .75, .25, 1)" });
+      }
+      playMoveSound(captured);
+
+      if (movingPiece) {
+        delete pieces[move.from];
+        if (isEnPassant) delete pieces[`${move.to[0]}${move.from[1]}`];
+        pieces[move.to] = move.promotion ? { ...movingPiece, type: move.promotion } : movingPiece;
+        if (movingPiece.type === "k" && Math.abs(FILES.indexOf(move.from[0]) - FILES.indexOf(move.to[0])) === 2) {
+          const rank = move.from[1];
+          const rookFrom = move.to[0] > move.from[0] ? `h${rank}` : `a${rank}`;
+          const rookTo = move.to[0] > move.from[0] ? `f${rank}` : `d${rank}`;
+          if (pieces[rookFrom]) {
+            pieces[rookTo] = pieces[rookFrom];
+            delete pieces[rookFrom];
+          }
+        }
+      }
+    }, reducedMotion ? 0 : index * 255);
+    ui.moveTimeouts.push(timeout);
+  });
+}
+
+function renderBoard(animationMoves = [], previousState = null) {
+  const state = ui.studyGame?.frames[ui.studyGame.cursor] || ui.state || initialPreview();
   const board = $("#chessboard");
   const isBlackView = ui.flipped ? ui.playerColor !== "black" : ui.playerColor === "black";
   const rankOrder = isBlackView ? "12345678" : RANKS;
@@ -98,7 +231,7 @@ function renderBoard() {
   const legalTargets = new Set(legalFromSelected.map((move) => move.slice(2, 4)));
   const lastMove = state.last_move || null;
   const currentColor = state.to_move || "white";
-  const canMove = Boolean(state.started && !state.result && !ui.busy && currentColor === ui.playerColor && ui.model.available);
+  const canMove = Boolean(!ui.studyGame && state.started && !state.result && !ui.busy && !ui.animating && currentColor === ui.playerColor && ui.model.available);
   const squares = [];
 
   ranks.forEach((rank) => {
@@ -145,10 +278,12 @@ function renderBoard() {
       if (source) submitMove(source, squareButton.dataset.square);
     });
   });
+  animateBoardMoves(animationMoves, previousState);
 }
 
 function onSquareClick(square) {
-  if (ui.busy || !ui.model.available || !ui.state?.started || ui.state.result || ui.state.to_move !== ui.playerColor) return;
+  if (ui.studyGame || ui.busy || ui.animating || !ui.model.available || !ui.state?.started || ui.state.result || ui.state.to_move !== ui.playerColor) return;
+  unlockAudio();
   const piece = ui.state.pieces?.[square];
   if (!ui.selected) {
     if (piece?.color === ui.playerColor) {
@@ -183,6 +318,8 @@ async function submitMove(from, to, promotion = "q") {
     renderBoard();
     return;
   }
+  ui.pendingMove = { from, to, promotion };
+  unlockAudio();
   ui.busy = true;
   ui.selected = null;
   updateGameControls();
@@ -190,23 +327,25 @@ async function submitMove(from, to, promotion = "q") {
   setTurnMessage("ChessNet is thinking…", "Your local model is choosing a move.", true);
   try {
     const response = await api("/api/move", { from, to, promotion: candidate.length === 5 ? promotion : null });
+    ui.busy = false;
     acceptState(response.state);
   } catch (error) {
+    ui.pendingMove = null;
+    ui.busy = false;
     showToast(error.message || "That move could not be made.");
-    await refreshState();
+    const refreshed = await refreshState();
+    if (!refreshed) renderBoard();
   } finally {
     ui.busy = false;
-    if (ui.state) acceptState(ui.state);
     updateGameControls();
-    renderBoard();
   }
 }
 
-function renderMoveHistory(history = []) {
+function renderMoveHistory(history = [], activePly = history.length - 1, interactive = false) {
   const target = $("#move-list");
   $("#move-count").textContent = `${history.length} ${history.length === 1 ? "move" : "moves"}`;
   if (!history.length) {
-    target.innerHTML = `<div class="empty-moves"><span>♙</span><p>Your game will appear here.<br /><small>Every great game starts somewhere.</small></p></div>`;
+    target.innerHTML = `<div class="empty-moves"><p>No moves yet.<br /><small>Notation will appear here.</small></p></div>`;
     return;
   }
   const byNumber = new Map();
@@ -215,11 +354,25 @@ function renderMoveHistory(history = []) {
     byNumber.get(entry.number)[entry.color] = entry.san;
     byNumber.get(entry.number)[`${entry.color}Index`] = index;
   });
-  const latestIndex = history.length - 1;
+  const moveCell = (san, index) => {
+    if (!san) return '<span class="move-san"></span>';
+    const active = index === activePly;
+    const classes = `move-san ${active ? "latest is-active" : ""}`;
+    return interactive
+      ? `<button class="${classes} move-jump" type="button" data-ply="${index}" aria-current="${active ? "step" : "false"}">${san}</button>`
+      : `<span class="${classes}">${san}</span>`;
+  };
   target.innerHTML = [...byNumber.values()].map((row) => `
-    <div class="move-row"><span class="move-number">${row.number}.</span><span class="move-san ${row.whiteIndex === latestIndex ? "latest" : ""}">${row.white || ""}</span><span class="move-san ${row.blackIndex === latestIndex ? "latest" : ""}">${row.black || ""}</span></div>
+    <div class="move-row"><span class="move-number">${row.number}.</span>${moveCell(row.white, row.whiteIndex)}${moveCell(row.black, row.blackIndex)}</div>
   `).join("");
-  target.scrollTop = target.scrollHeight;
+  if (interactive) {
+    target.querySelectorAll(".move-jump").forEach((button) => {
+      button.addEventListener("click", () => setStudyPly(Number(button.dataset.ply) + 1));
+    });
+    target.querySelector(`[data-ply="${activePly}"]`)?.scrollIntoView({ block: "nearest" });
+  } else {
+    target.scrollTop = target.scrollHeight;
+  }
 }
 
 function formatClock(milliseconds) {
@@ -252,12 +405,51 @@ function setTurnMessage(title, subtitle, live = false, over = false) {
   $("#turn-subtitle").textContent = subtitle;
   $("#turn-card").classList.toggle("is-live", live);
   $("#turn-card").classList.toggle("is-over", over);
-  $("#turn-icon").textContent = over ? "⚑" : live ? "◷" : "✳";
+  $("#turn-icon").textContent = over ? "✓" : live ? "●" : "○";
 }
 
 function acceptState(state) {
   if (!state) return;
+  ui.moveTimeouts.forEach((timeout) => window.clearTimeout(timeout));
+  ui.moveTimeouts = [];
   if (!state.pieces && !state.started) state = initialPreview();
+  const previousState = ui.state;
+  const previousMoveCount = previousState?.history?.length || 0;
+  const moveCount = state.history?.length || 0;
+  const addedMoves = moveCount - previousMoveCount;
+  const animationMoves = [];
+  let animationSourceState = previousState;
+  if (state.started && ui.pendingMove && addedMoves > 0) {
+    animationMoves.push(ui.pendingMove);
+    const engineMove = parseUciMove(state.last_move);
+    if (addedMoves > 1 && engineMove && `${engineMove.from}${engineMove.to}` !== `${ui.pendingMove.from}${ui.pendingMove.to}`) {
+      animationMoves.push(engineMove);
+    }
+    ui.pendingMove = null;
+  } else if (state.started && ui.startingGame && moveCount > 0) {
+    const firstEngineMove = parseUciMove(state.last_move);
+    if (firstEngineMove) {
+      animationMoves.push(firstEngineMove);
+      animationSourceState = initialPreview();
+    }
+  } else if (state.started && addedMoves > 0 && state.last_move && state.last_move !== previousState?.last_move) {
+    const latestMove = parseUciMove(state.last_move);
+    if (latestMove) animationMoves.push(latestMove);
+  }
+  if (ui.animationTimer) window.clearTimeout(ui.animationTimer);
+  ui.animationTimer = null;
+  ui.animating = false;
+  const reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  if (animationMoves.length && !reducedMotion) {
+    ui.animating = true;
+    ui.animationTimer = window.setTimeout(() => {
+      ui.animating = false;
+      ui.animationTimer = null;
+      renderBoard();
+      updateGameControls();
+    }, animationMoves.length * 255);
+  }
+  if (state.started) ui.startingGame = false;
   if (state.clocks_ms) {
     const running = state.started && !state.result ? state.to_move : null;
     state._baseClock = running ? state.clocks_ms[running] : 0;
@@ -272,7 +464,7 @@ function acceptState(state) {
   ui.playerColor = state.player_color || ui.playerColor;
   if (!state.started) ui.flipped = false;
   $("#player-caption").textContent = `Playing as ${capitalize(ui.playerColor)}`;
-  $("#game-title").textContent = state.mode ? `${capitalize(state.mode)} · ${state.time_control}` : "A friendly match";
+  $("#game-title").textContent = state.mode ? `${capitalize(state.mode)} · ${state.time_control}` : "New game";
   if (!state.started) {
     setTurnMessage(ui.model.available ? "Board is ready" : "Waiting for your model", ui.model.available ? "Choose a time and start a game." : "Connect a checkpoint to begin playing.");
   } else if (state.result) {
@@ -293,24 +485,30 @@ function acceptState(state) {
         : "THINKING"
     : "READY";
   engineBadge.classList.toggle("is-live", state.started && !state.result);
-  $("#resign-button").disabled = !state.started || Boolean(state.result) || ui.busy;
+  $("#resign-button").disabled = !state.started || Boolean(state.result) || ui.busy || ui.animating;
   document.querySelectorAll(".side-option").forEach((option) => {
     const selected = option.dataset.color === ui.playerColor;
     option.classList.toggle("is-selected", selected);
     option.setAttribute("aria-pressed", String(selected));
     option.disabled = Boolean(state.started && !state.result);
   });
+  if (ui.studyGame) {
+    renderModeControls();
+    renderStudyView();
+    return;
+  }
   renderMoveHistory(state.history || []);
   renderModeControls();
-  renderBoard();
+  renderBoard(animationMoves, animationSourceState);
   renderClocks();
   updateGameControls();
 }
 
 function updateGameControls() {
   const button = $("#new-game-button");
-  button.disabled = !ui.model.available || ui.busy;
+  button.disabled = !ui.model.available || ui.busy || ui.animating;
   button.classList.toggle("is-loading", ui.busy);
+  $("#resign-button").disabled = !ui.state?.started || Boolean(ui.state?.result) || ui.busy || ui.animating;
 }
 
 function setModelStatus(model) {
@@ -346,15 +544,22 @@ async function api(path, body) {
 async function refreshState() {
   try {
     const data = await api("/api/state");
-    if (data.state) acceptState(data.state);
-    else if (!ui.state) acceptState(initialPreview());
+    if (data.state) {
+      acceptState(data.state);
+      return true;
+    }
+    if (!ui.state) acceptState(initialPreview());
+    return false;
   } catch {
     if (!ui.state) acceptState(initialPreview());
+    return false;
   }
 }
 
 async function startGame() {
   if (!ui.model.available || ui.busy) return;
+  unlockAudio();
+  ui.startingGame = true;
   ui.busy = true;
   updateGameControls();
   setTurnMessage("Setting the board…", "Getting a fresh game ready for you.", true);
@@ -365,17 +570,20 @@ async function startGame() {
       increment: ui.control.increment,
       player_color: ui.playerColor,
     });
+    ui.busy = false;
+    if (ui.studyGame) clearStudyView();
     ui.flipped = false;
     acceptState(data.state);
-    showToast(`${capitalize(ui.mode)} game started. Have a good one.`);
+    showToast(`${capitalize(ui.mode)} game started.`);
   } catch (error) {
+    ui.busy = false;
+    ui.startingGame = false;
     setTurnMessage("Could not start a game", error.message || "Check your engine setup.", false, true);
     showToast(error.message || "Could not start a game.");
+    renderBoard();
   } finally {
     ui.busy = false;
-    if (ui.state) acceptState(ui.state);
     updateGameControls();
-    renderBoard();
   }
 }
 
@@ -401,6 +609,173 @@ function capitalize(value = "") {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+function looksLikePgn(text) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  return /^\s*\[[A-Za-z][\w-]*\s+"/m.test(text)
+    || /(?:^|\s)1\.\s*(?:\.\.\s*)?(?:[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8]|O-O(?:-O)?)/m.test(text);
+}
+
+function openPgnDialog(text = "") {
+  const textarea = $("#pgn-text");
+  if (text) textarea.value = text;
+  const dialog = $("#pgn-dialog");
+  if (!dialog.open) dialog.showModal();
+  window.requestAnimationFrame(() => {
+    textarea.focus({ preventScroll: true });
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  });
+}
+
+function stopStudyPlayback() {
+  if (ui.studyTimer) window.clearInterval(ui.studyTimer);
+  ui.studyTimer = null;
+}
+
+function setStudyPly(ply) {
+  if (!ui.studyGame) return;
+  unlockAudio();
+  const previousPly = ui.studyGame.cursor;
+  const lastPly = ui.studyGame.frames.length - 1;
+  ui.studyGame.cursor = Math.max(0, Math.min(lastPly, Number(ply) || 0));
+  if (ui.studyGame.cursor === lastPly) stopStudyPlayback();
+  const animationMoves = [];
+  let animationSource = null;
+  if (ui.studyGame.cursor === previousPly + 1) {
+    const frame = ui.studyGame.frames[ui.studyGame.cursor];
+    const move = parseUciMove(frame.last_move);
+    if (move) {
+      animationMoves.push(move);
+      animationSource = ui.studyGame.frames[previousPly];
+      const movingPiece = animationSource.pieces[move.from];
+      const captured = Boolean(animationSource.pieces[move.to])
+        || (movingPiece?.type === "p" && move.from[0] !== move.to[0]);
+      playMoveSound(captured);
+    }
+  } else if (ui.studyGame.cursor === previousPly - 1) {
+    const move = parseUciMove(ui.studyGame.frames[previousPly].last_move);
+    if (move) {
+      animationMoves.push({ ...move, from: move.to, to: move.from });
+      animationSource = ui.studyGame.frames[previousPly];
+      playMoveSound(false);
+    }
+  }
+  renderStudyView(animationMoves, animationSource);
+}
+
+function renderStudyView(animationMoves = [], animationSource = null) {
+  const study = ui.studyGame;
+  if (!study) return;
+  const { headers, history, frames } = study;
+  const frame = frames[study.cursor];
+  const white = headers.White && headers.White !== "?" ? headers.White : "White";
+  const black = headers.Black && headers.Black !== "?" ? headers.Black : "Black";
+  const blackView = ui.flipped ? ui.playerColor !== "black" : ui.playerColor === "black";
+  const topColor = blackView ? "white" : "black";
+  const bottomColor = topColor === "white" ? "black" : "white";
+  const names = { white, black };
+
+  document.body.classList.add("is-reviewing");
+  $("#review-controls").hidden = false;
+  $("#resign-button").hidden = true;
+  $(".opponent-strip .person-name").textContent = names[topColor];
+  $(".self-strip .person-name").textContent = names[bottomColor];
+  $("#engine-caption").textContent = `${capitalize(topColor)} · PGN review`;
+  $("#player-caption").textContent = `${capitalize(bottomColor)} · PGN review`;
+  $("#game-title").textContent = `${white} vs ${black}`;
+
+  const eventParts = [headers.Event, headers.Date].filter((value) => value && value !== "?");
+  const currentMove = history[study.cursor - 1];
+  const positionText = study.cursor === 0
+    ? "Starting position"
+    : study.cursor === history.length
+      ? `Final position${headers.Result && headers.Result !== "*" ? ` · ${headers.Result}` : ""}`
+      : `${currentMove.number}${currentMove.color === "black" ? "..." : "."} ${currentMove.san}`;
+  $("#review-position").textContent = positionText;
+  $("#review-range").max = String(history.length);
+  $("#review-range").value = String(study.cursor);
+  const playButton = $("#review-play");
+  playButton.textContent = ui.studyTimer ? "Ⅱ" : "▶";
+  playButton.setAttribute("aria-label", ui.studyTimer ? "Pause game" : "Play game");
+  playButton.title = ui.studyTimer ? "Pause game" : "Play game";
+  $("#review-first").disabled = study.cursor === 0;
+  $("#review-previous").disabled = study.cursor === 0;
+  $("#review-next").disabled = study.cursor === history.length;
+  $("#review-last").disabled = study.cursor === history.length;
+
+  const turnTitle = study.cursor === history.length ? "Final position" : "Game review";
+  const detail = `${positionText} · ${study.cursor} of ${history.length} plies`;
+  setTurnMessage(turnTitle, [...eventParts, detail].join(" · "));
+  $("#engine-turn-badge").textContent = "REVIEW";
+  $("#engine-turn-badge").classList.remove("is-live");
+  renderMoveHistory(history, study.cursor - 1, true);
+  renderBoard(animationMoves, animationSource);
+  renderClocks();
+  updateGameControls();
+}
+
+function restorePlayerLabels() {
+  const opponentName = $(".opponent-strip .person-name");
+  opponentName.replaceChildren(document.createTextNode("ChessNet "));
+  const statusDot = document.createElement("span");
+  statusDot.className = `online-indicator ${ui.model.available ? "is-online" : "is-offline"}`;
+  statusDot.id = "engine-status-dot";
+  opponentName.append(statusDot);
+
+  const playerName = $(".self-strip .person-name");
+  playerName.replaceChildren(document.createTextNode("You"));
+  $("#engine-caption").textContent = ui.model.available ? "Your local policy model" : "Waiting for a model checkpoint";
+  $("#player-caption").textContent = `Playing as ${capitalize(ui.playerColor)}`;
+}
+
+function clearStudyView() {
+  stopStudyPlayback();
+  ui.studyGame = null;
+  document.body.classList.remove("is-reviewing");
+  $("#review-controls").hidden = true;
+  $("#resign-button").hidden = false;
+  restorePlayerLabels();
+}
+
+function exitStudy() {
+  if (!ui.studyGame) return;
+  clearStudyView();
+  if (ui.state) acceptState(ui.state);
+}
+
+async function reviewPgn() {
+  const pgn = $("#pgn-text").value.trim();
+  const status = $("#pgn-status");
+  const button = $("#review-pgn-button");
+  if (!pgn) {
+    status.textContent = "Paste a PGN or open a .pgn file first.";
+    return;
+  }
+  if (ui.state?.started && !ui.state.result) {
+    status.textContent = "Finish the active game before opening a PGN review.";
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "Reading…";
+  status.textContent = "Reading the game…";
+  try {
+    const response = await api("/api/pgn", { pgn });
+    const study = response.study;
+    if (!study?.frames?.length || !study.history?.length) throw new Error("No moves were found in that PGN.");
+    clearStudyView();
+    ui.studyGame = { ...study, cursor: 0 };
+    ui.flipped = false;
+    $("#pgn-dialog").close();
+    renderStudyView();
+    showToast(`Loaded ${study.history.length} plies for review.`);
+  } catch (error) {
+    status.textContent = error.message || "Could not read that PGN.";
+  } finally {
+    button.disabled = false;
+    button.textContent = "Review game";
+  }
+}
+
 function bindControls() {
   document.querySelectorAll(".mode-tab").forEach((button) => {
     button.addEventListener("click", () => {
@@ -424,20 +799,81 @@ function bindControls() {
       });
       if (ui.state && !ui.state.started) ui.state.player_color = ui.playerColor;
       $("#player-caption").textContent = `Playing as ${capitalize(ui.playerColor)}`;
-      renderBoard();
+      if (ui.studyGame) renderStudyView();
+      else renderBoard();
     });
   });
   $("#new-game-button").addEventListener("click", startGame);
   $("#flip-board-button").addEventListener("click", () => {
     ui.flipped = !ui.flipped;
-    renderBoard();
+    if (ui.studyGame) renderStudyView();
+    else renderBoard();
   });
   $("#resign-button").addEventListener("click", resignGame);
+  const pgnDialog = $("#pgn-dialog");
+  const pgnInput = $("#pgn-file-input");
+  $("#open-pgn-button").addEventListener("click", () => openPgnDialog());
+  $("#close-pgn-dialog").addEventListener("click", () => pgnDialog.close());
+  $("#choose-pgn-file").addEventListener("click", () => pgnInput.click());
+  $("#review-pgn-button").addEventListener("click", reviewPgn);
+  pgnInput.addEventListener("change", async () => {
+    const [file] = pgnInput.files || [];
+    if (file) {
+      try {
+        $("#pgn-text").value = await file.text();
+        $("#pgn-status").textContent = `${file.name} ready to review.`;
+      } catch {
+        $("#pgn-status").textContent = "Could not read that PGN file.";
+      }
+    }
+    pgnInput.value = "";
+  });
+  $("#review-first").addEventListener("click", () => setStudyPly(0));
+  $("#review-previous").addEventListener("click", () => setStudyPly((ui.studyGame?.cursor || 0) - 1));
+  $("#review-next").addEventListener("click", () => setStudyPly((ui.studyGame?.cursor || 0) + 1));
+  $("#review-last").addEventListener("click", () => setStudyPly((ui.studyGame?.frames.length || 1) - 1));
+  $("#review-range").addEventListener("input", (event) => setStudyPly(event.currentTarget.value));
+  $("#review-play").addEventListener("click", () => {
+    if (!ui.studyGame) return;
+    unlockAudio();
+    if (ui.studyTimer) {
+      stopStudyPlayback();
+      renderStudyView();
+      return;
+    }
+    if (ui.studyGame.cursor >= ui.studyGame.frames.length - 1) ui.studyGame.cursor = 0;
+    renderStudyView();
+    ui.studyTimer = window.setInterval(() => setStudyPly(ui.studyGame.cursor + 1), 800);
+    renderStudyView();
+  });
+  $("#exit-review-button").addEventListener("click", exitStudy);
+  document.addEventListener("paste", (event) => {
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest("input, textarea, [contenteditable='true']")) return;
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (!looksLikePgn(text)) return;
+    event.preventDefault();
+    openPgnDialog(text);
+  });
+  $("#sound-toggle").addEventListener("click", (event) => {
+    ui.soundEnabled = !ui.soundEnabled;
+    event.currentTarget.setAttribute("aria-pressed", String(ui.soundEnabled));
+    event.currentTarget.title = ui.soundEnabled ? "Turn move sounds off" : "Turn move sounds on";
+    $("#sound-label").textContent = ui.soundEnabled ? "Sound on" : "Sound off";
+    event.currentTarget.classList.toggle("is-muted", !ui.soundEnabled);
+    if (ui.soundEnabled) {
+      void unlockAudio();
+    } else {
+      void ui.audioContext?.suspend();
+    }
+    showToast(ui.soundEnabled ? "Move sounds are on." : "Move sounds are off.");
+  });
   $("#engine-help-button").addEventListener("click", () => $("#setup-dialog").showModal());
   $("#engine-help-top").addEventListener("click", () => $("#setup-dialog").showModal());
   $("#theme-button").addEventListener("click", () => {
-    document.body.classList.toggle("soft-contrast");
-    showToast(document.body.classList.contains("soft-contrast") ? "Soft contrast is on." : "Standard contrast is on.");
+    const enabled = document.body.classList.toggle("soft-contrast");
+    $("#theme-button").setAttribute("aria-pressed", String(enabled));
+    showToast(enabled ? "Softer board colors are on." : "Standard board colors are on.");
   });
 }
 
@@ -453,7 +889,7 @@ async function initialize() {
   } catch {
     setModelStatus({
       available: false,
-      detail: "Open Hearth Chess with python -m whisker.serve to connect the local engine.",
+      detail: "Start Whisker with python -m src.serve to connect the local engine.",
     });
   }
   await refreshState();

@@ -160,7 +160,7 @@ def main() -> None:
     engine_args = [
         f"cmd={args.python}",
         "arg=-m",
-        "arg=whisker.engine",
+        "arg=src.engine",
         "arg=--checkpoint",
         f"arg={args.checkpoint.resolve()}",
         "arg=--device",

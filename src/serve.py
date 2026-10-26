@@ -1,7 +1,7 @@
-"""Serve Hearth Chess and connect its local board API to ChessNet.
+"""Serve Whisker and connect its local board API to ChessNet.
 
 Run with:
-    python -m whisker.serve --checkpoint checkpoints/path/to/checkpoint.pt
+    python -m src.serve --checkpoint checkpoints/path/to/checkpoint.pt
 
 The page can also be opened without an installed model. In that case it stays
 in preview mode until a trained checkpoint is supplied.
@@ -16,6 +16,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -28,6 +29,8 @@ STATIC_FILES = {
     "/index.html": (WEB_ROOT / "index.html", "text/html; charset=utf-8"),
     "/styles.css": (WEB_ROOT / "styles.css", "text/css; charset=utf-8"),
     "/app.js": (WEB_ROOT / "app.js", "text/javascript; charset=utf-8"),
+    "/audio/move.wav": (WEB_ROOT / "audio" / "move.wav", "audio/wav"),
+    "/audio/capture.wav": (WEB_ROOT / "audio" / "capture.wav", "audio/wav"),
 }
 TIME_CONTROLS = {
     "bullet": {(1, 0), (2, 1)},
@@ -73,7 +76,7 @@ class ChessApp:
         if self.checkpoint is None:
             self.model_error = (
                 "No checkpoint found. Pass one with "
-                "python -m whisker.serve --checkpoint path/to/checkpoint.pt"
+                "python -m src.serve --checkpoint path/to/checkpoint.pt"
             )
             return
         if not self.checkpoint.is_file():
@@ -119,6 +122,59 @@ class ChessApp:
             self._tick_clock()
             self._update_outcome()
             return {"state": self._serialize_session()}
+
+    def parse_pgn(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pgn_text = payload.get("pgn")
+        if not isinstance(pgn_text, str) or not pgn_text.strip():
+            raise ApiError(400, "Paste a PGN game to review.")
+        if len(pgn_text.encode("utf-8")) > 1_000_000:
+            raise ApiError(413, "The PGN is too large to review.")
+
+        try:
+            import chess
+            import chess.pgn
+        except ImportError as exc:
+            raise ApiError(503, "PGN review requires the python-chess package.") from exc
+        self.chess = chess
+
+        try:
+            game = chess.pgn.read_game(StringIO(pgn_text))
+        except Exception as exc:
+            raise ApiError(400, f"Could not read the PGN: {exc}") from None
+        if game is None:
+            raise ApiError(400, "No chess game was found in that PGN.")
+        if game.errors:
+            raise ApiError(400, f"The PGN contains an invalid move: {game.errors[0]}")
+
+        board = game.board()
+        history = []
+        frames = [self._study_position(board)]
+        for move in game.mainline_moves():
+            if move not in board.legal_moves:
+                raise ApiError(400, "The PGN contains a move that is illegal in its position.")
+            color = "white" if board.turn == chess.WHITE else "black"
+            number = board.fullmove_number
+            san = board.san(move)
+            board.push(move)
+            history.append({"number": number, "color": color, "san": san})
+            frames.append(self._study_position(board, move.uci()))
+            if len(history) > 3000:
+                raise ApiError(413, "The PGN has too many moves to review in one session.")
+        if not history:
+            raise ApiError(400, "That PGN does not contain any moves.")
+
+        tag_names = ("Event", "Site", "Date", "Round", "White", "Black", "Result", "ECO")
+        headers = {name: game.headers.get(name, "") for name in tag_names}
+        return {"study": {"headers": headers, "history": history, "frames": frames}}
+
+    def _study_position(self, board: Any, last_move: str | None = None) -> dict[str, Any]:
+        checked_king = board.king(board.turn) if board.is_check() else None
+        return {
+            "pieces": self._piece_map(board),
+            "to_move": "white" if board.turn == self.chess.WHITE else "black",
+            "last_move": last_move,
+            "in_check": self.chess.square_name(checked_king) if checked_king is not None else None,
+        }
 
     def _preview_board(self) -> dict[str, Any]:
         try:
@@ -360,7 +416,7 @@ class ApiError(Exception):
 
 def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "HearthChess/1.0"
+        server_version = "Whisker/1.0"
 
         def do_GET(self) -> None:
             route = urlparse(self.path).path
@@ -389,6 +445,8 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
                     result = app.new_game(payload)
                 elif route == "/api/move":
                     result = app.play_player_move(payload)
+                elif route == "/api/pgn":
+                    result = app.parse_pgn(payload)
                 elif route == "/api/resign":
                     result = app.resign()
                 else:
@@ -407,8 +465,8 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 raise ApiError(400, "Invalid request length.") from None
-            if length < 0 or length > 16_384:
-                raise ApiError(413, "Request body is too large.")
+            if length < 0 or length > 1_048_576:
+                raise ApiError(413, "Request body exceeds 1 MB.")
             raw = self.rfile.read(length)
             value = json.loads(raw or b"{}")
             if not isinstance(value, dict):
@@ -440,7 +498,7 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Hearth Chess local web app.")
+    parser = argparse.ArgumentParser(description="Run the Whisker local web app.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="ChessNet checkpoint (.pt or .pth)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--threads", type=int, default=1)
@@ -460,7 +518,7 @@ def main() -> None:
 
     app = ChessApp(checkpoint, args.device, args.threads)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
-    print(f"Hearth Chess is serving at http://{args.host}:{args.port}")
+    print(f"Whisker is serving at http://{args.host}:{args.port}")
     if app.model_available:
         print(f"ChessNet: {app.checkpoint} on {app.device}")
     else:
@@ -468,7 +526,7 @@ def main() -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping Hearth Chess.")
+        print("\nStopping Whisker.")
     finally:
         server.server_close()
 

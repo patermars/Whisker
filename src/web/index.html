@@ -3,28 +3,28 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f4efe7" />
-    <meta name="description" content="A calm place to play chess against your local ChessNet model." />
-    <title>Hearth Chess — Play</title>
+    <meta name="theme-color" content="#efeee7" />
+    <meta name="description" content="Play chess against your locally running ChessNet model." />
+    <title>Whisker — Play</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar" aria-label="Main navigation">
-        <a class="brand" href="/" aria-label="Hearth Chess home">
+        <a class="brand" href="/" aria-label="Whisker home">
           <span class="brand-mark" aria-hidden="true">♞</span>
-          <span class="brand-copy"><strong>hearth</strong><small>CHESS CLUB</small></span>
+          <span class="brand-copy"><strong>Whisker</strong><small>LOCAL CHESS ENGINE</small></span>
         </a>
 
         <div class="nav-label">PLAY</div>
         <nav class="nav-list">
           <a class="nav-link is-active" href="#play" aria-current="page">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.8 19 12 8 18.2V5.8Z"/><path d="M4.5 5v14"/></svg>
-            <span>Play</span><span class="nav-count">01</span>
+            <span>Play</span>
           </a>
           <a class="nav-link nav-link-muted" href="#moves" title="Your recent moves">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 19.5h15M6 16l3.3-4 2.5 2 5.9-7"/><path d="M15.5 7H18v2.5"/></svg>
-            <span>Game notes</span>
+            <span>Moves</span>
           </a>
         </nav>
 
@@ -35,45 +35,36 @@
           <p id="sidebar-engine-detail">Connecting to your model…</p>
           <button class="text-button" id="engine-help-button" type="button">Engine setup <span aria-hidden="true">↗</span></button>
         </div>
-        <div class="sidebar-profile">
-          <div class="profile-avatar">P</div>
-          <div><strong>Player one</strong><small>Local account</small></div>
-          <button class="icon-button profile-menu" type="button" aria-label="Profile options" title="Profile options">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>
-          </button>
-        </div>
       </aside>
 
       <main class="main-area" id="play">
         <header class="topbar">
-          <div class="breadcrumbs"><span>PLAY</span><i>/</i><strong>COMPUTER</strong></div>
+          <div class="breadcrumbs"><span>LOCAL PLAY</span><i>/</i><strong>CHESSNET</strong></div>
           <div class="topbar-right">
-            <button class="local-badge" id="engine-help-top" type="button" title="Engine setup"><span></span> Runs on this machine</button>
-            <button class="icon-button theme-button" id="theme-button" type="button" aria-label="Toggle soft contrast" title="Toggle soft contrast">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.4A8.1 8.1 0 0 1 8.6 4a8.2 8.2 0 1 0 11.4 11.4Z"/><path d="M16.7 3.5v3.8M14.8 5.4h3.8"/></svg>
+            <button class="local-badge" id="engine-help-top" type="button" title="Engine setup"><span></span> Local engine</button>
+            <button class="icon-button theme-button" id="theme-button" type="button" aria-label="Toggle softer board colors" aria-pressed="false" title="Toggle softer board colors">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17"/></svg>
             </button>
-            <div class="top-avatar" aria-label="Player one">P</div>
           </div>
         </header>
 
         <section class="page-intro">
           <div>
-            <p class="eyebrow"><span class="eyebrow-line"></span> YOUR QUIET CORNER OF THE BOARD</p>
-            <h1>A little time for a better move.</h1>
-            <p class="intro-copy">Set the pace, settle in, and see what your model has in mind.</p>
+            <p class="eyebrow"><span class="eyebrow-line"></span> HUMAN VS. LOCAL MODEL</p>
+            <h1>Play against your ChessNet model</h1>
+            <p class="intro-copy">Choose a clock and a side. Your trained policy plays the other color.</p>
           </div>
-          <div class="intro-note"><span class="note-sparkle">✳</span><span>One board.<br /><strong>Endless possibilities.</strong></span></div>
         </section>
 
         <section class="pace-card" aria-label="Game settings">
           <div class="pace-heading">
-            <div><span class="section-kicker">SET YOUR PACE</span><h2>Choose a time control</h2></div>
+            <div><span class="section-kicker">NEW GAME</span><h2>Choose your clock</h2></div>
           </div>
           <div class="pace-controls">
-            <div class="mode-tabs" role="tablist" aria-label="Game mode">
-              <button class="mode-tab" type="button" role="tab" data-mode="bullet" aria-selected="false"><span class="mode-icon mode-icon-bullet">ϟ</span><span class="mode-text"><strong>Bullet</strong><small>Fast &amp; lively</small></span></button>
-              <button class="mode-tab is-selected" type="button" role="tab" data-mode="blitz" aria-selected="true"><span class="mode-icon mode-icon-blitz">◷</span><span class="mode-text"><strong>Blitz</strong><small>Quick thinking</small></span></button>
-              <button class="mode-tab" type="button" role="tab" data-mode="rapid" aria-selected="false"><span class="mode-icon mode-icon-rapid">◴</span><span class="mode-text"><strong>Rapid</strong><small>Room to breathe</small></span></button>
+            <div class="mode-tabs" role="group" aria-label="Time control type">
+              <button class="mode-tab" type="button" data-mode="bullet" aria-pressed="false"><span class="mode-text"><strong>Bullet</strong><small>1–2 minutes</small></span></button>
+              <button class="mode-tab is-selected" type="button" data-mode="blitz" aria-pressed="true"><span class="mode-text"><strong>Blitz</strong><small>3–5 minutes</small></span></button>
+              <button class="mode-tab" type="button" data-mode="rapid" aria-pressed="false"><span class="mode-text"><strong>Rapid</strong><small>10–15 minutes</small></span></button>
             </div>
             <div class="settings-divider"></div>
             <div class="control-picks">
@@ -82,7 +73,7 @@
                 <div class="choice-options" id="time-options" role="group" aria-label="Time control"></div>
               </div>
               <div class="choice-group side-choice">
-                <span class="choice-label">YOUR SIDE</span>
+                <span class="choice-label">PLAY AS</span>
                 <div class="side-options" role="group" aria-label="Choose your color">
                   <button type="button" class="side-option is-selected" data-color="white" aria-pressed="true"><span class="side-disc side-disc-white"></span>White</button>
                   <button type="button" class="side-option" data-color="black" aria-pressed="false"><span class="side-disc side-disc-black"></span>Black</button>
@@ -91,7 +82,7 @@
             </div>
             <button class="new-game-button" id="new-game-button" type="button" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 1 4M20 4v7h-7"/><path d="M20 11a8 8 0 0 0-14-5"/></svg>
-              <span>New game</span>
+              <span>Start game</span>
             </button>
           </div>
         </section>
@@ -116,8 +107,8 @@
 
             <div class="player-strip self-strip">
               <div class="person-block">
-                <div class="self-avatar" aria-hidden="true">P</div>
-                <div><div class="person-name">Player one <span class="you-label">YOU</span></div><div class="person-caption" id="player-caption">Playing as White</div></div>
+                <div class="self-avatar" aria-hidden="true">Y</div>
+                <div><div class="person-name">You</div><div class="person-caption" id="player-caption">Playing as White</div></div>
               </div>
               <div class="clock-box" id="player-clock-box"><span class="clock-icon">◷</span><span class="clock-value" id="player-clock">05:00</span></div>
             </div>
@@ -125,41 +116,66 @@
 
           <aside class="game-panel">
             <div class="game-panel-head">
-              <div><span class="section-kicker">THIS GAME</span><h2 id="game-title">A friendly match</h2></div>
-              <button class="icon-button panel-menu-button" type="button" aria-label="Game options" title="Game options"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
+              <div><span class="section-kicker">GAME</span><h2 id="game-title">New game</h2></div>
+              <button class="icon-button panel-menu-button" id="open-pgn-button" type="button" aria-label="Import a PGN game" title="Paste or open a PGN"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/></svg></button>
             </div>
 
             <div class="turn-card" id="turn-card">
-              <span class="turn-icon" id="turn-icon">✳</span>
+              <span class="turn-icon" id="turn-icon" aria-hidden="true">○</span>
               <div><strong id="turn-title">Board is ready</strong><small id="turn-subtitle">Choose a time and start a game.</small></div>
+            </div>
+
+            <div class="review-controls" id="review-controls" hidden>
+              <div class="review-navigation" aria-label="PGN replay controls">
+                <button type="button" id="review-first" aria-label="Go to start" title="Go to start">|◀</button>
+                <button type="button" id="review-previous" aria-label="Previous move" title="Previous move">‹</button>
+                <button type="button" id="review-play" aria-label="Play game" title="Play game">▶</button>
+                <button type="button" id="review-next" aria-label="Next move" title="Next move">›</button>
+                <button type="button" id="review-last" aria-label="Go to final position" title="Go to final position">▶|</button>
+              </div>
+              <input id="review-range" type="range" min="0" max="0" value="0" aria-label="Move through the game" />
+              <div class="review-readout"><span id="review-position">Starting position</span><button type="button" id="exit-review-button">Close review</button></div>
             </div>
 
             <div class="move-section" id="moves">
               <div class="move-heading"><span>MOVE HISTORY</span><span class="move-count" id="move-count">0 moves</span></div>
-              <div class="move-list" id="move-list"><div class="empty-moves"><span>♙</span><p>Your game will appear here.<br /><small>Every great game starts somewhere.</small></p></div></div>
+              <div class="move-list" id="move-list"><div class="empty-moves"><p>No moves yet.<br /><small>Notation will appear here.</small></p></div></div>
             </div>
 
             <div class="panel-actions">
-              <button class="panel-action" id="flip-board-button" type="button" title="Flip board"><span class="action-icon flip-icon">⇅</span>Flip board</button>
-              <button class="panel-action resign-action" id="resign-button" type="button" disabled><span class="action-icon">⚑</span>Resign</button>
+              <button class="panel-action" id="flip-board-button" type="button" title="Flip board">Flip board</button>
+              <button class="panel-action sound-action" id="sound-toggle" type="button" aria-pressed="true" title="Turn move sounds off"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h4l5 4V6l-5 4H4Z"/><path d="M17 9a5 5 0 0 1 0 6M19.5 6.5a8.5 8.5 0 0 1 0 11"/></svg><span id="sound-label">Sound on</span></button>
+              <button class="panel-action resign-action" id="resign-button" type="button" disabled>Resign</button>
             </div>
-            <div class="game-footnote"><span class="footnote-mark">✦</span><span>Thoughtful moves, at your own pace.</span></div>
+            <div class="game-footnote">Open or paste a PGN to replay a match.</div>
           </aside>
         </section>
 
-        <footer class="page-footer"><span>HEARTH CHESS <i>·</i> A LOCAL PLAY SPACE</span><span>Made for the love of the game <b>♡</b></span></footer>
+        <footer class="page-footer"><span>WHISKER <i>·</i> LOCAL PLAY</span><span>Your model runs on this machine.</span></footer>
       </main>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <dialog class="pgn-dialog" id="pgn-dialog" aria-labelledby="pgn-dialog-title">
+      <section class="pgn-dialog-shell">
+        <header class="pgn-dialog-head">
+          <div><span class="section-kicker">GAME REVIEW</span><h2 id="pgn-dialog-title">Replay a match</h2></div>
+          <button class="icon-button" id="close-pgn-dialog" type="button" aria-label="Close PGN import" title="Close">×</button>
+        </header>
+        <p class="pgn-hint">Paste a PGN or open a <code>.pgn</code> file. Whisker will replay the main line on the board.</p>
+        <textarea id="pgn-text" rows="10" spellcheck="false" aria-label="PGN game text" placeholder='[Event "Casual game"]&#10;[White "White"]&#10;[Black "Black"]&#10;&#10;1. e4 e5 2. Nf3 Nc6 3. Bb5 a6'></textarea>
+        <div class="pgn-dialog-foot"><span id="pgn-status">Your game stays in this browser session.</span><div><button class="pgn-file-button" id="choose-pgn-file" type="button">Open .pgn</button><button class="pgn-submit-button" id="review-pgn-button" type="button">Review game</button></div></div>
+      </section>
+    </dialog>
+    <input id="pgn-file-input" type="file" accept=".pgn,text/plain,application/x-chess-pgn" hidden />
     <dialog class="setup-dialog" id="setup-dialog">
       <form method="dialog">
         <button class="dialog-close icon-button" aria-label="Close setup details" value="close">×</button>
         <div class="dialog-mark">♞</div>
         <span class="section-kicker">LOCAL ENGINE</span>
         <h2>Connect your ChessNet model</h2>
-        <p>Hearth Chess runs your trained policy model on this machine. Start the local server with the checkpoint you want to play against:</p>
-        <pre><code>python -m whisker.serve --checkpoint path/to/checkpoint.pt</code></pre>
+        <p>Whisker runs your trained policy model on this machine. Start the local server with the checkpoint you want to play against:</p>
+        <pre><code>python -m src.serve --checkpoint path/to/checkpoint.pt</code></pre>
         <p class="dialog-foot" id="dialog-model-detail">No checkpoint was detected in the usual checkpoints folder.</p>
         <button class="dialog-done" value="close">Got it</button>
       </form>
