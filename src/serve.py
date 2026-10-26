@@ -1,4 +1,4 @@
-"""Serve the Whisker web app and local ChessNet API."""
+"""Serve the Whisker web app and local Whisker engine API."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import mimetypes
 import re
+import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -117,7 +118,7 @@ class ChessApp:
                 "available": self.model_available,
                 "checkpoint": str(self.checkpoint) if self.checkpoint else None,
                 "device": str(self.device) if self.device is not None else None,
-                "detail": self.model_error or "ChessNet is ready.",
+                "detail": self.model_error or "Whisker is ready.",
             },
         }
 
@@ -209,7 +210,7 @@ class ChessApp:
 
     def new_game(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.model_available:
-            raise ApiError(503, self.model_error or "ChessNet is not ready.")
+            raise ApiError(503, self.model_error or "Whisker is not ready.")
         mode = str(payload.get("mode", "blitz"))
         try:
             minutes = int(payload.get("minutes", 5))
@@ -219,6 +220,8 @@ class ChessApp:
         if mode not in TIME_CONTROLS or (minutes, increment) not in TIME_CONTROLS[mode]:
             raise ApiError(400, "Choose one of the available time controls.")
         player_color = str(payload.get("player_color", "white"))
+        if player_color == "random":
+            player_color = secrets.choice(("white", "black"))
         if player_color not in {"white", "black"}:
             raise ApiError(400, "Choose white or black.")
 
@@ -235,9 +238,6 @@ class ChessApp:
                 "result": None,
                 "last_tick": time.monotonic(),
             }
-            if player_color == "black":
-                self._play_engine_turn()
-            self._update_outcome()
             return {"state": self._serialize_session()}
 
     def play_player_move(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -252,7 +252,7 @@ class ChessApp:
             board = session["board"]
             expected_turn = self.chess.WHITE if session["player_color"] == "white" else self.chess.BLACK
             if board.turn != expected_turn:
-                raise ApiError(409, "Wait for ChessNet to finish its move.")
+                raise ApiError(409, "Wait for Whisker to finish its move.")
             source = str(payload.get("from", ""))
             target = str(payload.get("to", ""))
             promotion = str(payload.get("promotion") or "q").lower()
@@ -273,9 +273,22 @@ class ChessApp:
             self._push_move(move)
             self._add_increment("white" if expected_turn else "black")
             self._update_outcome()
-            if not session["result"]:
-                self._play_engine_turn()
-                self._update_outcome()
+            return {"state": self._serialize_session()}
+
+    def play_engine_move(self) -> dict[str, Any]:
+        with self.lock:
+            if self.session is None:
+                raise ApiError(409, "Start a game first.")
+            self._tick_clock()
+            self._update_outcome()
+            session = self.session
+            if session["result"]:
+                return {"state": self._serialize_session()}
+            expected_turn = self.chess.WHITE if session["player_color"] == "white" else self.chess.BLACK
+            if session["board"].turn == expected_turn:
+                raise ApiError(409, "It is your turn.")
+            self._play_engine_turn()
+            self._update_outcome()
             return {"state": self._serialize_session()}
 
     def resign(self) -> dict[str, Any]:
@@ -306,10 +319,10 @@ class ChessApp:
         try:
             move = self.select_move(board, self.model, self.device, candidates=legal_moves)
         except Exception as exc:
-            print(f"ChessNet inference error: {exc}")
+            print(f"Whisker inference error: {exc}")
             session["result"] = {
                 "winner": session["player_color"],
-                "message": "ChessNet hit an inference error. Start a fresh game to try again.",
+                "message": "Whisker hit an inference error. Start a fresh game to try again.",
                 "termination": "engine_error",
             }
             return
@@ -319,7 +332,7 @@ class ChessApp:
         if move is None or move not in board.legal_moves:
             session["result"] = {
                 "winner": session["player_color"],
-                "message": "ChessNet could not choose a legal move.",
+                "message": "Whisker could not choose a legal move.",
                 "termination": "engine_error",
             }
             return
@@ -453,6 +466,8 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
                     result = app.new_game(payload)
                 elif route == "/api/move":
                     result = app.play_player_move(payload)
+                elif route == "/api/engine-move":
+                    result = app.play_engine_move()
                 elif route == "/api/pgn":
                     result = app.parse_pgn(payload)
                 elif route == "/api/resign":
@@ -507,7 +522,7 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Whisker local web app.")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="ChessNet checkpoint (.pt or .pth)")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Whisker checkpoint (.pt or .pth)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
@@ -528,9 +543,9 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     print(f"Whisker is serving at http://{args.host}:{args.port}")
     if app.model_available:
-        print(f"ChessNet: {app.checkpoint} on {app.device}")
+        print(f"Whisker: {app.checkpoint} on {app.device}")
     else:
-        print(f"ChessNet unavailable: {app.model_error}")
+        print(f"Whisker unavailable: {app.model_error}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

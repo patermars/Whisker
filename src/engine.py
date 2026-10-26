@@ -1,4 +1,4 @@
-"""UCI adapter for the ChessNet policy network."""
+"""UCI adapter for the Whisker policy network."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ import torch
 
 from .prepare_data import encode_board
 from .paths import PROJECT_ROOT
-from .train import ChessNet
+from .train import Whisker
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> ChessNet:
+def load_model(checkpoint_path: Path, device: torch.device) -> Whisker:
     """Load either this project's training checkpoint or a plain state dict."""
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
@@ -56,12 +56,12 @@ def load_model(checkpoint_path: Path, device: torch.device) -> ChessNet:
             if key.startswith("tower.") and key.endswith(".conv1.weight")
         }
     except (KeyError, IndexError, ValueError) as exc:
-        raise ValueError("checkpoint does not match the ChessNet architecture") from exc
+        raise ValueError("checkpoint does not match the Whisker architecture") from exc
 
     if not block_ids:
-        raise ValueError("checkpoint has no ChessNet residual blocks")
+        raise ValueError("checkpoint has no Whisker residual blocks")
 
-    model = ChessNet(
+    model = Whisker(
         channels=channels,
         num_blocks=max(block_ids) + 1,
         policy_size=policy_size,
@@ -77,7 +77,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> ChessNet:
 
 def select_move(
     board: chess.Board,
-    model: ChessNet,
+    model: Whisker,
     device: torch.device,
     candidates: list[chess.Move] | None = None,
 ) -> chess.Move | None:
@@ -155,7 +155,7 @@ def emit(line: str) -> None:
     print(line, flush=True)
 
 
-def run_uci(model: ChessNet, device: torch.device) -> None:
+def run_uci(model: Whisker, device: torch.device) -> None:
     board = chess.Board()
 
     for raw_line in sys.stdin:
@@ -164,7 +164,7 @@ def run_uci(model: ChessNet, device: torch.device) -> None:
             continue
 
         if command == "uci":
-            emit("id name ChessNet Policy")
+            emit("id name Whisker Policy")
             emit("id author local")
             emit("uciok")
         elif command == "isready":
@@ -196,7 +196,7 @@ def run_uci(model: ChessNet, device: torch.device) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run ChessNet as a UCI chess engine.")
+    parser = argparse.ArgumentParser(description="Run Whisker as a UCI chess engine.")
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -226,7 +226,7 @@ def main() -> None:
     try:
         model = load_model(args.checkpoint, device)
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"ChessNet: {exc}", file=sys.stderr, flush=True)
+        print(f"Whisker: {exc}", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
 
     run_uci(model, device)

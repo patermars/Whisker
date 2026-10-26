@@ -1,6 +1,6 @@
 # Whisker
 
-Whisker trains a ChessNet model from rated PGN games and provides a local web
+Whisker trains its chess model from rated PGN games and provides a local web
 app and UCI engine. The policy learns to choose recorded moves; the value head
 learns game results. During play, the engine selects its highest-scoring legal
 move without searching ahead.

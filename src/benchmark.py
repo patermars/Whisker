@@ -61,7 +61,7 @@ def write_openings(path: Path, count: int, plies: int, seed: int) -> None:
         for number in range(count):
             board = chess.Board()
             game = chess.pgn.Game()
-            game.headers["Event"] = "ChessNet local benchmark openings"
+            game.headers["Event"] = "Whisker local benchmark openings"
             game.headers["Site"] = "Local"
             game.headers["Round"] = str(number + 1)
             node = game
@@ -108,7 +108,7 @@ def performance_rating(opponent_elo: int, score: float) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Play ChessNet against Stockfish at several calibrated UCI_Elo settings."
+        description="Play Whisker against Stockfish at several calibrated UCI_Elo settings."
     )
     parser.add_argument(
         "--checkpoint",
@@ -156,7 +156,7 @@ def main() -> None:
     opening_file = args.output_dir / "openings.pgn"
     write_openings(opening_file, args.games // 2, args.plies, args.seed)
 
-    engine_name = "ChessNet"
+    engine_name = "Whisker"
     engine_args = [
         f"cmd={args.python}",
         "arg=-m",

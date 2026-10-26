@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#efeee7" />
-    <meta name="description" content="Play chess against your locally running ChessNet model." />
+    <meta name="description" content="Play chess against Whisker, your local chess companion." />
     <title>Whisker — Play</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -31,7 +31,7 @@
         <div class="sidebar-spacer"></div>
         <div class="engine-card" id="sidebar-engine-card">
           <div class="engine-card-top"><span class="engine-dot" id="sidebar-engine-dot"></span><span id="sidebar-engine-label">Checking engine</span></div>
-          <div class="engine-name">ChessNet <span>LOCAL</span></div>
+          <div class="engine-name">Whisker <span>LOCAL</span></div>
           <p id="sidebar-engine-detail">Connecting to your model…</p>
           <button class="text-button" id="engine-help-button" type="button">Engine setup <span aria-hidden="true">↗</span></button>
         </div>
@@ -39,22 +39,15 @@
 
       <main class="main-area" id="play">
         <header class="topbar">
-          <div class="breadcrumbs"><span>LOCAL PLAY</span><i>/</i><strong>CHESSNET</strong></div>
+          <div class="breadcrumbs"><span>LOCAL PLAY</span><i>/</i><strong>WHISKER</strong></div>
           <div class="topbar-right">
             <button class="local-badge" id="engine-help-top" type="button" title="Engine setup"><span></span> Local engine</button>
-            <button class="icon-button theme-button" id="theme-button" type="button" aria-label="Toggle softer board colors" aria-pressed="false" title="Toggle softer board colors">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17"/></svg>
+            <button class="icon-button theme-button" id="theme-button" type="button" aria-label="Toggle dark theme" aria-pressed="false" title="Switch to dark theme">
+              <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.4A8.5 8.5 0 0 1 8.6 3.8 8.6 8.6 0 1 0 20.2 15.4Z"/></svg>
+              <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
             </button>
           </div>
         </header>
-
-        <section class="page-intro">
-          <div>
-            <p class="eyebrow"><span class="eyebrow-line"></span> HUMAN VS. LOCAL MODEL</p>
-            <h1>Play against your ChessNet model</h1>
-            <p class="intro-copy">Choose a clock and a side. Your trained policy plays the other color.</p>
-          </div>
-        </section>
 
         <section class="pace-card" aria-label="Game settings">
           <div class="pace-heading">
@@ -77,6 +70,7 @@
                 <div class="side-options" role="group" aria-label="Choose your color">
                   <button type="button" class="side-option is-selected" data-color="white" aria-pressed="true"><span class="side-disc side-disc-white"></span>White</button>
                   <button type="button" class="side-option" data-color="black" aria-pressed="false"><span class="side-disc side-disc-black"></span>Black</button>
+                  <button type="button" class="side-option random-side-option" data-color="random" aria-pressed="false"><span aria-hidden="true">⚄</span>Random</button>
                 </div>
               </div>
             </div>
@@ -92,9 +86,8 @@
             <div class="player-strip opponent-strip">
               <div class="person-block">
                 <div class="opponent-avatar" aria-hidden="true"><img src="/assets/pieces/wintrchess/standard/black_king.svg" alt="" /></div>
-                <div><div class="person-name">ChessNet <span class="online-indicator" id="engine-status-dot"></span></div><div class="person-caption" id="engine-caption">Your local policy model</div></div>
+                <div><div class="person-name">Whisker <span class="online-indicator" id="engine-status-dot"></span></div><div class="person-caption" id="engine-caption">Your local chess companion</div></div>
               </div>
-              <div class="player-badges"><span class="badge badge-model">YOUR MODEL</span><span class="badge badge-turn" id="engine-turn-badge">READY</span></div>
               <div class="clock-box" id="engine-clock-box"><span class="clock-icon">◷</span><span class="clock-value" id="engine-clock">05:00</span></div>
             </div>
 
@@ -151,7 +144,6 @@
           </aside>
         </section>
 
-        <footer class="page-footer"><span>WHISKER <i>·</i> LOCAL PLAY</span><span>Your model runs on this machine.</span></footer>
       </main>
     </div>
 
@@ -173,7 +165,7 @@
         <button class="dialog-close icon-button" aria-label="Close setup details" value="close">×</button>
         <div class="dialog-mark">♞</div>
         <span class="section-kicker">LOCAL ENGINE</span>
-        <h2>Connect your ChessNet model</h2>
+        <h2>Connect Whisker</h2>
         <p>Whisker runs your trained policy model on this machine. Start the local server with the checkpoint you want to play against:</p>
         <pre><code>python -m src.serve --checkpoint path/to/checkpoint.pt</code></pre>
         <p class="dialog-foot" id="dialog-model-detail">No checkpoint was detected in the usual checkpoints folder.</p>

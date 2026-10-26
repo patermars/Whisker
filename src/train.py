@@ -1,4 +1,4 @@
-"""Train the ChessNet policy and value network."""
+"""Train the Whisker policy and value network."""
 
 import argparse
 import logging
@@ -120,7 +120,7 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class ChessNet(nn.Module):
+class Whisker(nn.Module):
     """AlphaZero-style dual-headed network for chess.
 
     Architecture:
@@ -387,7 +387,7 @@ def make_data_loaders(
 
 @torch.no_grad()
 def validate(
-    model: ChessNet,
+    model: Whisker,
     val_loader: DataLoader,
     device: torch.device,
     max_samples: int = 10_000,
@@ -449,7 +449,7 @@ def validate(
 
 def save_checkpoint(
     path: str,
-    model: ChessNet,
+    model: Whisker,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     step: int,
@@ -506,7 +506,7 @@ def read_model_state(path: str, device: torch.device) -> Dict[str, torch.Tensor]
 
 
 def infer_model_architecture(path: str) -> Dict[str, Any]:
-    """Infer ChessNet dimensions so resume/fine-tune use the checkpoint's model."""
+    """Infer Whisker dimensions so resume/fine-tune use the checkpoint's model."""
     state = read_model_state(path, torch.device("cpu"))
     try:
         block_ids = {
@@ -524,10 +524,10 @@ def infer_model_architecture(path: str) -> Dict[str, Any]:
             "use_se": any(key.startswith("tower.0.se_fc1.") for key in state),
         }
     except (KeyError, IndexError, ValueError) as exc:
-        raise ValueError("checkpoint does not match the ChessNet architecture") from exc
+        raise ValueError("checkpoint does not match the Whisker architecture") from exc
 
 
-def load_model_weights(path: str, model: ChessNet, device: torch.device) -> None:
+def load_model_weights(path: str, model: Whisker, device: torch.device) -> None:
     """Load model weights only, for a fine-tuning stage with fresh optimizer state."""
     normalized_state = read_model_state(path, device)
 
@@ -543,7 +543,7 @@ def load_model_weights(path: str, model: ChessNet, device: torch.device) -> None
 
 def load_checkpoint(
     path: str,
-    model: ChessNet,
+    model: Whisker,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: torch.device,
@@ -791,7 +791,7 @@ def main() -> None:
     train_size = len(dataset) - val_size
     logger.info(f"Split: {train_size:,} train / {val_size:,} val (80/20)")
 
-    model = ChessNet(
+    model = Whisker(
         channels=args.channels,
         num_blocks=args.blocks,
         policy_size=config["policy_size"],
@@ -806,7 +806,7 @@ def main() -> None:
             "optimizer and learning-rate schedule start fresh"
         )
     logger.info(
-        f"ChessNet: {args.blocks} blocks × {args.channels} channels, "
+        f"Whisker: {args.blocks} blocks × {args.channels} channels, "
         f"policy/value heads={args.policy_channels}/{args.value_channels}, "
         f"SE={args.use_se}, {model.count_parameters():,} parameters"
     )
