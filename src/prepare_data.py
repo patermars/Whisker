@@ -430,10 +430,10 @@ def _process_game_batch_worker(
 
 
 def _process_single_batch_worker(
-    games: list[chess.pgn.Game],
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    games: list[tuple[int, chess.pgn.Game]],
+) -> list[tuple[int, tuple[np.ndarray, np.ndarray, np.ndarray]]]:
     """Encode a batch of games for the single-band preprocessing path."""
-    return [process_game(game) for game in games]
+    return [(game_id, process_game(game)) for game_id, game in games]
 
 
 class HDF5Writer:
@@ -471,19 +471,42 @@ class HDF5Writer:
             compression="gzip",
             compression_opts=4,
         )
+        self.ds_game_ids = self.f.create_dataset(
+            "game_ids",
+            shape=(0,),
+            maxshape=(None,),
+            dtype="int64",
+            chunks=(4096,),
+            compression="gzip",
+            compression_opts=4,
+        )
+        self.f.attrs["schema_version"] = 2
 
         self._buf_boards: list[np.ndarray] = []
         self._buf_policies: list[np.ndarray] = []
         self._buf_values: list[np.ndarray] = []
+        self._buf_game_ids: list[np.ndarray] = []
         self._buf_count = 0
         self.total_positions = 0
+        self.game_count = 0
+        self._seen_game_ids: set[int] = set()
 
-    def add(self, boards: np.ndarray, policies: np.ndarray, values: np.ndarray) -> None:
+    def add(
+        self,
+        boards: np.ndarray,
+        policies: np.ndarray,
+        values: np.ndarray,
+        game_id: int,
+    ) -> None:
         """Buffer position data from one game."""
         self._buf_boards.append(boards)
         self._buf_policies.append(policies)
         self._buf_values.append(values)
+        self._buf_game_ids.append(np.full(len(boards), game_id, dtype=np.int64))
         self._buf_count += len(boards)
+        if game_id not in self._seen_game_ids:
+            self.game_count += 1
+            self._seen_game_ids.add(game_id)
 
         if self._buf_count >= FLUSH_BATCH:
             self.flush()
@@ -496,6 +519,7 @@ class HDF5Writer:
         all_boards = np.concatenate(self._buf_boards, axis=0)
         all_policies = np.concatenate(self._buf_policies, axis=0)
         all_values = np.concatenate(self._buf_values, axis=0)
+        all_game_ids = np.concatenate(self._buf_game_ids, axis=0)
 
         n = len(all_boards)
         old_len = self.ds_boards.shape[0]
@@ -504,22 +528,26 @@ class HDF5Writer:
         self.ds_boards.resize(new_len, axis=0)
         self.ds_policies.resize(new_len, axis=0)
         self.ds_values.resize(new_len, axis=0)
+        self.ds_game_ids.resize(new_len, axis=0)
 
         self.ds_boards[old_len:new_len] = all_boards
         self.ds_policies[old_len:new_len] = all_policies
         self.ds_values[old_len:new_len] = all_values
+        self.ds_game_ids[old_len:new_len] = all_game_ids
 
         self.total_positions = new_len
 
         self._buf_boards.clear()
         self._buf_policies.clear()
         self._buf_values.clear()
+        self._buf_game_ids.clear()
         self._buf_count = 0
 
     def close(self, complete: bool = True) -> None:
         """Flush remaining data, mark completion status, and close the file."""
         self.flush()
         self.f.attrs["complete"] = complete
+        self.f.attrs["game_count"] = self.game_count
         self.f.close()
 
     @property
@@ -578,8 +606,10 @@ def output_matches_request(
                 == (-1 if max_games is None else max_games)
                 and float(dataset.attrs.get("sample_rate", 1.0)) == sample_rate
                 and all(name in dataset for name in ("boards", "policies", "values"))
+                and "game_ids" in dataset
                 and dataset["boards"].shape[0] == dataset["policies"].shape[0]
                 and dataset["boards"].shape[0] == dataset["values"].shape[0]
+                and dataset["boards"].shape[0] == dataset["game_ids"].shape[0]
             )
     except (OSError, KeyError, TypeError, ValueError):
         return False
@@ -686,10 +716,10 @@ def prepare_elo_bands(
             ]
         ],
     ) -> None:
-        for _game_number, encoded_bands in results:
+        for game_number, encoded_bands in results:
             for band, (boards, policies, values) in encoded_bands:
                 if max_games is None or kept_games[band] < max_games:
-                    writers[band].add(boards, policies, values)
+                    writers[band].add(boards, policies, values, game_number)
                     kept_games[band] += 1
                     total_positions[band] += len(boards)
 
@@ -911,7 +941,7 @@ def main() -> None:
         ProcessPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
     )
     pending: dict[Future, None] = {}
-    batch: list[chess.pgn.Game] = []
+    batch: list[tuple[int, chess.pgn.Game]] = []
     reserved_games = 0
     max_pending = max(1, worker_count * 2)
     batch_size = min(8, worker_count)
@@ -921,8 +951,8 @@ def main() -> None:
         pending.pop(future)
         results = future.result()
         reserved_games -= len(results)
-        for boards, policies, values in results:
-            writer.add(boards, policies, values)
+        for game_id, (boards, policies, values) in results:
+            writer.add(boards, policies, values, game_id)
             kept_games += 1
             total_positions += len(boards)
 
@@ -958,12 +988,12 @@ def main() -> None:
             # Keep a bounded queue so workers stay busy without growing memory use.
             if executor is None:
                 boards, policies, values = process_game(game)
-                writer.add(boards, policies, values)
+                writer.add(boards, policies, values, total_games)
                 kept_games += 1
                 total_positions += len(boards)
             else:
                 if args.max_games is None or kept_games + reserved_games < args.max_games:
-                    batch.append(game)
+                    batch.append((total_games, game))
                     reserved_games += 1
                     if len(batch) >= batch_size:
                         submit_single_batch()

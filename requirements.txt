@@ -9,6 +9,7 @@ numpy>=1.24.0
 requests>=2.31.0
 torch==2.12.0+cpu
 tqdm>=4.66.0
+boto3>=1.34.0,<2
 
 # === Logging (optional — train.py auto-detects) ===
 # Install ONE of these for richer logging; console logging works without either.

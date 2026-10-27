@@ -159,6 +159,7 @@ def main() -> None:
     engine_name = "Whisker"
     engine_args = [
         f"cmd={args.python}",
+        f"dir={PROJECT_ROOT}",
         "arg=-m",
         "arg=src.engine",
         "arg=--checkpoint",
@@ -173,10 +174,12 @@ def main() -> None:
 
     for elo in args.elos:
         pgn_path = args.output_dir / f"stockfish-{elo}.pgn"
+        engine_log_path = args.output_dir / f"whisker-{elo}.stderr.log"
         command = [
             cutechess,
             "-engine",
             *engine_args,
+            f"stderr={engine_log_path}",
             "-engine",
             f"cmd={stockfish}",
             f"name=Stockfish-{elo}",
@@ -202,18 +205,31 @@ def main() -> None:
         ]
 
         pgn_path.unlink(missing_ok=True)
+        engine_log_path.unlink(missing_ok=True)
         print(f"\n[{elo}] Running {args.games} games at tc={args.tc} ...", flush=True)
         try:
             subprocess.run(command, check=True, cwd=PROJECT_ROOT)
         except subprocess.CalledProcessError as exc:
+            engine_error = (
+                engine_log_path.read_text(encoding="utf-8", errors="replace").strip()
+                if engine_log_path.is_file()
+                else ""
+            )
             raise SystemExit(
                 f"Cute Chess exited with status {exc.returncode}; see its output above."
+                + (f"\nWhisker stderr ({engine_log_path}):\n{engine_error}" if engine_error else "")
             ) from exc
 
         if not pgn_path.is_file():
+            engine_error = (
+                engine_log_path.read_text(encoding="utf-8", errors="replace").strip()
+                if engine_log_path.is_file()
+                else ""
+            )
             raise SystemExit(
                 f"Cute Chess did not create {pgn_path}. Check that both engines started "
                 "and that the match completed."
+                + (f"\nWhisker stderr ({engine_log_path}):\n{engine_error}" if engine_error else "")
             )
 
         try:

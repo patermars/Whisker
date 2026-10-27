@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import mimetypes
+import os
 import re
 import secrets
 import threading
 import time
+from dataclasses import dataclass, field
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
@@ -45,6 +49,17 @@ TIME_CONTROLS = {
     "blitz": {(3, 0), (5, 0), (5, 3)},
     "rapid": {(10, 0), (15, 10)},
 }
+SESSION_TTL_SECONDS = 6 * 60 * 60
+SESSION_CLEANUP_INTERVAL_SECONDS = 10 * 60
+SESSION_COOKIE_NAME = "whisker_session"
+logger = logging.getLogger("whisker.serve")
+
+
+@dataclass
+class BrowserSession:
+    game: dict[str, Any] | None = None
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    last_seen: float = field(default_factory=time.monotonic)
 
 
 def find_checkpoint() -> Path | None:
@@ -64,8 +79,9 @@ def find_checkpoint() -> Path | None:
 
 class ChessApp:
     def __init__(self, checkpoint: Path | None, device_name: str, threads: int) -> None:
-        self.lock = threading.RLock()
-        self.session: dict[str, Any] | None = None
+        self.sessions: dict[str, BrowserSession] = {}
+        self.sessions_lock = threading.RLock()
+        self.inference_lock = threading.Lock()
         self.checkpoint = checkpoint
         self.device_name = device_name
         self.threads = threads
@@ -74,6 +90,16 @@ class ChessApp:
         self.select_move: Any = None
         self.model_error: str | None = None
         self.chess: Any = None
+        self.cookie_secure = os.getenv("WHISKER_COOKIE_SECURE", "0").lower() in {
+            "1", "true", "yes", "on"
+        }
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._session_cleanup_loop,
+            name="whisker-session-cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
         self._load_engine()
 
     @property
@@ -86,9 +112,11 @@ class ChessApp:
                 "No checkpoint found. Pass one with "
                 "python -m src.serve --checkpoint path/to/checkpoint.pt"
             )
+            logger.error("Whisker checkpoint is not configured")
             return
         if not self.checkpoint.is_file():
-            self.model_error = f"Checkpoint not found: {self.checkpoint}"
+            self.model_error = "Checkpoint is missing."
+            logger.error("Whisker checkpoint does not exist: %s", self.checkpoint)
             return
         try:
             import chess
@@ -109,27 +137,75 @@ class ChessApp:
         except Exception as exc:  # Keep the page available to explain setup issues.
             self.model = None
             self.select_move = None
-            self.model_error = f"Could not load the checkpoint: {exc}"
+            self.model_error = "Whisker could not load its model."
+            logger.exception("Could not initialize Whisker model")
 
     def health(self) -> dict[str, Any]:
+        available = self.model_available
         return {
-            "ok": True,
+            "ok": available,
             "model": {
-                "available": self.model_available,
-                "checkpoint": str(self.checkpoint) if self.checkpoint else None,
+                "available": available,
                 "device": str(self.device) if self.device is not None else None,
-                "detail": self.model_error or "Whisker is ready.",
             },
         }
 
-    def state(self) -> dict[str, Any]:
-        with self.lock:
-            if self.session is None:
-                board = self._preview_board()
-                return {"state": board}
-            self._tick_clock()
-            self._update_outcome()
-            return {"state": self._serialize_session()}
+    def get_browser_session(
+        self, session_id: str | None = None
+    ) -> tuple[str, BrowserSession, bool]:
+        """Find or create one visitor's session and refresh its expiry time."""
+        now = time.monotonic()
+        with self.sessions_lock:
+            self._expire_sessions_locked(now)
+            if session_id is not None:
+                session = self.sessions.get(session_id)
+                if session is not None:
+                    session.last_seen = now
+                    return session_id, session, False
+            new_id = secrets.token_urlsafe(32)
+            session = BrowserSession(last_seen=now)
+            self.sessions[new_id] = session
+            return new_id, session, True
+
+    def _expire_sessions_locked(self, now: float) -> None:
+        expired_before = now - SESSION_TTL_SECONDS
+        for session_id, session in list(self.sessions.items()):
+            if session.last_seen >= expired_before:
+                continue
+            if not session.lock.acquire(blocking=False):
+                continue
+            try:
+                if session.last_seen < expired_before:
+                    self.sessions.pop(session_id, None)
+            finally:
+                session.lock.release()
+
+    def _session_cleanup_loop(self) -> None:
+        while not self._cleanup_stop.wait(SESSION_CLEANUP_INTERVAL_SECONDS):
+            with self.sessions_lock:
+                self._expire_sessions_locked(time.monotonic())
+
+    def close(self) -> None:
+        self._cleanup_stop.set()
+
+    def _get_session(self, session_id: str) -> BrowserSession:
+        with self.sessions_lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                # A valid request can race session expiry; give it a fresh game slot.
+                session = BrowserSession()
+                self.sessions[session_id] = session
+            session.last_seen = time.monotonic()
+            return session
+
+    def state(self, session_id: str) -> dict[str, Any]:
+        session = self._get_session(session_id)
+        with session.lock:
+            if session.game is None:
+                return {"state": self._preview_board()}
+            self._tick_clock(session.game)
+            self._update_outcome(session.game)
+            return {"state": self._serialize_session(session.game)}
 
     def parse_pgn(self, payload: dict[str, Any]) -> dict[str, Any]:
         pgn_text = payload.get("pgn")
@@ -148,11 +224,12 @@ class ChessApp:
         try:
             game = chess.pgn.read_game(StringIO(pgn_text))
         except Exception as exc:
-            raise ApiError(400, f"Could not read the PGN: {exc}") from None
+            logger.exception("PGN parser failed")
+            raise ApiError(400, "Could not read that PGN.") from None
         if game is None:
             raise ApiError(400, "No chess game was found in that PGN.")
         if game.errors:
-            raise ApiError(400, f"The PGN contains an invalid move: {game.errors[0]}")
+            raise ApiError(400, "The PGN contains an invalid move.")
 
         board = game.board()
         history = []
@@ -208,9 +285,11 @@ class ChessApp:
         except ImportError:
             return {"started": False, "pieces": None, "history": [], "result": None}
 
-    def new_game(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def new_game(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         if not self.model_available:
-            raise ApiError(503, self.model_error or "Whisker is not ready.")
+            raise ApiError(503, "Whisker is not ready. Try again later.")
         mode = str(payload.get("mode", "blitz"))
         try:
             minutes = int(payload.get("minutes", 5))
@@ -225,8 +304,9 @@ class ChessApp:
         if player_color not in {"white", "black"}:
             raise ApiError(400, "Choose white or black.")
 
-        with self.lock:
-            self.session = {
+        session = self._get_session(session_id)
+        with session.lock:
+            session.game = {
                 "board": self.chess.Board(),
                 "mode": mode,
                 "minutes": minutes,
@@ -238,19 +318,22 @@ class ChessApp:
                 "result": None,
                 "last_tick": time.monotonic(),
             }
-            return {"state": self._serialize_session()}
+            return {"state": self._serialize_session(session.game)}
 
-    def play_player_move(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self.lock:
-            if self.session is None:
+    def play_player_move(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        browser_session = self._get_session(session_id)
+        with browser_session.lock:
+            game = browser_session.game
+            if game is None:
                 raise ApiError(409, "Start a game first.")
-            self._tick_clock()
-            self._update_outcome()
-            session = self.session
-            if session["result"]:
+            self._tick_clock(game)
+            self._update_outcome(game)
+            if game["result"]:
                 raise ApiError(409, "This game has ended.")
-            board = session["board"]
-            expected_turn = self.chess.WHITE if session["player_color"] == "white" else self.chess.BLACK
+            board = game["board"]
+            expected_turn = self.chess.WHITE if game["player_color"] == "white" else self.chess.BLACK
             if board.turn != expected_turn:
                 raise ApiError(409, "Wait for Whisker to finish its move.")
             source = str(payload.get("from", ""))
@@ -270,114 +353,114 @@ class ChessApp:
             if move not in board.legal_moves:
                 raise ApiError(400, "That move is not legal in this position.")
 
-            self._push_move(move)
-            self._add_increment("white" if expected_turn else "black")
-            self._update_outcome()
-            return {"state": self._serialize_session()}
+            self._push_move(game, move)
+            self._add_increment(game, "white" if expected_turn else "black")
+            self._update_outcome(game)
+            return {"state": self._serialize_session(game)}
 
-    def play_engine_move(self) -> dict[str, Any]:
-        with self.lock:
-            if self.session is None:
+    def play_engine_move(self, session_id: str) -> dict[str, Any]:
+        browser_session = self._get_session(session_id)
+        with browser_session.lock:
+            game = browser_session.game
+            if game is None:
                 raise ApiError(409, "Start a game first.")
-            self._tick_clock()
-            self._update_outcome()
-            session = self.session
-            if session["result"]:
-                return {"state": self._serialize_session()}
-            expected_turn = self.chess.WHITE if session["player_color"] == "white" else self.chess.BLACK
-            if session["board"].turn == expected_turn:
+            self._tick_clock(game)
+            self._update_outcome(game)
+            if game["result"]:
+                return {"state": self._serialize_session(game)}
+            expected_turn = self.chess.WHITE if game["player_color"] == "white" else self.chess.BLACK
+            if game["board"].turn == expected_turn:
                 raise ApiError(409, "It is your turn.")
-            self._play_engine_turn()
-            self._update_outcome()
-            return {"state": self._serialize_session()}
+            self._play_engine_turn(game)
+            self._update_outcome(game)
+            return {"state": self._serialize_session(game)}
 
-    def resign(self) -> dict[str, Any]:
-        with self.lock:
-            if self.session is None or self.session["result"]:
+    def resign(self, session_id: str) -> dict[str, Any]:
+        browser_session = self._get_session(session_id)
+        with browser_session.lock:
+            game = browser_session.game
+            if game is None or game["result"]:
                 raise ApiError(409, "There is no active game to resign.")
-            self._tick_clock()
-            if self.session["result"]:
-                return {"state": self._serialize_session()}
-            winner = "black" if self.session["player_color"] == "white" else "white"
-            self.session["result"] = {
+            self._tick_clock(game)
+            if game["result"]:
+                return {"state": self._serialize_session(game)}
+            winner = "black" if game["player_color"] == "white" else "white"
+            game["result"] = {
                 "winner": winner,
                 "message": f"{winner.capitalize()} wins by resignation.",
                 "termination": "resignation",
             }
-            return {"state": self._serialize_session()}
+            return {"state": self._serialize_session(game)}
 
-    def _play_engine_turn(self) -> None:
-        session = self.session
-        board = session["board"]
+    def _play_engine_turn(self, game: dict[str, Any]) -> None:
+        board = game["board"]
         engine_color = "white" if board.turn == self.chess.WHITE else "black"
-        if engine_color == session["player_color"]:
+        if engine_color == game["player_color"]:
             return
         legal_moves = list(board.legal_moves)
         if not legal_moves:
-            self._update_outcome()
+            self._update_outcome(game)
             return
         try:
-            move = self.select_move(board, self.model, self.device, candidates=legal_moves)
+            with self.inference_lock:
+                move = self.select_move(board, self.model, self.device, candidates=legal_moves)
         except Exception as exc:
-            print(f"Whisker inference error: {exc}")
-            session["result"] = {
-                "winner": session["player_color"],
+            logger.exception("Whisker inference failed")
+            game["result"] = {
+                "winner": game["player_color"],
                 "message": "Whisker hit an inference error. Start a fresh game to try again.",
                 "termination": "engine_error",
             }
             return
-        self._settle_clock_at(time.monotonic())
-        if session["result"]:
+        self._settle_clock_at(game, time.monotonic())
+        if game["result"]:
             return
         if move is None or move not in board.legal_moves:
-            session["result"] = {
-                "winner": session["player_color"],
+            game["result"] = {
+                "winner": game["player_color"],
                 "message": "Whisker could not choose a legal move.",
                 "termination": "engine_error",
             }
             return
-        self._push_move(move)
-        self._add_increment(engine_color)
+        self._push_move(game, move)
+        self._add_increment(game, engine_color)
 
-    def _push_move(self, move: Any) -> None:
-        session = self.session
-        board = session["board"]
+    def _push_move(self, game: dict[str, Any], move: Any) -> None:
+        board = game["board"]
         color = "white" if board.turn == self.chess.WHITE else "black"
         number = board.fullmove_number
         san = board.san(move)
         board.push(move)
-        session["history"].append({"number": number, "color": color, "san": san})
-        session["last_move"] = move.uci()
-        session["last_tick"] = time.monotonic()
+        game["history"].append({"number": number, "color": color, "san": san})
+        game["last_move"] = move.uci()
+        game["last_tick"] = time.monotonic()
 
-    def _add_increment(self, color: str) -> None:
-        self.session["clocks_ms"][color] += self.session["increment"] * 1000
+    def _add_increment(self, game: dict[str, Any], color: str) -> None:
+        game["clocks_ms"][color] += game["increment"] * 1000
 
-    def _tick_clock(self) -> None:
-        if self.session is not None and self.session["result"] is None:
-            self._settle_clock_at(time.monotonic())
+    def _tick_clock(self, game: dict[str, Any]) -> None:
+        if game["result"] is None:
+            self._settle_clock_at(game, time.monotonic())
 
-    def _settle_clock_at(self, now: float) -> None:
-        session = self.session
-        if session is None or session["result"] is not None:
+    def _settle_clock_at(self, game: dict[str, Any], now: float) -> None:
+        if game["result"] is not None:
             return
-        color = "white" if session["board"].turn == self.chess.WHITE else "black"
-        elapsed_ms = max(0, int((now - session["last_tick"]) * 1000))
-        session["clocks_ms"][color] = max(0, session["clocks_ms"][color] - elapsed_ms)
-        session["last_tick"] = now
-        if session["clocks_ms"][color] <= 0:
+        color = "white" if game["board"].turn == self.chess.WHITE else "black"
+        elapsed_ms = max(0, int((now - game["last_tick"]) * 1000))
+        game["clocks_ms"][color] = max(0, game["clocks_ms"][color] - elapsed_ms)
+        game["last_tick"] = now
+        if game["clocks_ms"][color] <= 0:
             winner = "black" if color == "white" else "white"
-            session["result"] = {
+            game["result"] = {
                 "winner": winner,
                 "message": f"{winner.capitalize()} wins on time.",
                 "termination": "time",
             }
 
-    def _update_outcome(self) -> None:
-        session = self.session
-        if session is None or session["result"] is not None:
+    def _update_outcome(self, game: dict[str, Any]) -> None:
+        if game["result"] is not None:
             return
-        outcome = session["board"].outcome()
+        outcome = game["board"].outcome()
         if outcome is None:
             return
         winner = None
@@ -390,29 +473,28 @@ class ChessApp:
             message = f"{winner.capitalize()} wins by checkmate."
         else:
             message = f"{winner.capitalize()} wins by {termination}."
-        session["result"] = {"winner": winner, "message": message, "termination": termination}
+        game["result"] = {"winner": winner, "message": message, "termination": termination}
 
-    def _serialize_session(self) -> dict[str, Any]:
-        session = self.session
-        board = session["board"]
+    def _serialize_session(self, game: dict[str, Any]) -> dict[str, Any]:
+        board = game["board"]
         legal_moves = []
-        expected_turn = self.chess.WHITE if session["player_color"] == "white" else self.chess.BLACK
-        if session["result"] is None and board.turn == expected_turn:
+        expected_turn = self.chess.WHITE if game["player_color"] == "white" else self.chess.BLACK
+        if game["result"] is None and board.turn == expected_turn:
             legal_moves = [move.uci() for move in board.legal_moves]
-        time_control = f"{session['minutes']}|{session['increment']}"
+        time_control = f"{game['minutes']}|{game['increment']}"
         return {
             "started": True,
-            "mode": session["mode"],
+            "mode": game["mode"],
             "time_control": time_control,
-            "player_color": session["player_color"],
+            "player_color": game["player_color"],
             "to_move": "white" if board.turn == self.chess.WHITE else "black",
             "pieces": self._piece_map(board),
             "legal_moves": legal_moves,
-            "history": session["history"],
-            "clocks_ms": dict(session["clocks_ms"]),
-            "last_move": session["last_move"],
+            "history": game["history"],
+            "clocks_ms": dict(game["clocks_ms"]),
+            "last_move": game["last_move"],
             "in_check": self.chess.square_name(board.king(board.turn)) if board.is_check() else None,
-            "result": session["result"],
+            "result": game["result"],
         }
 
     def _piece_map(self, board: Any) -> dict[str, dict[str, str]]:
@@ -439,14 +521,47 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "Whisker/1.0"
 
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._cookie_to_set: str | None = None
+            super().__init__(*args, **kwargs)
+
+        def _request_session_id(self) -> str:
+            cookie_header = self.headers.get("Cookie", "")
+            supplied_id = None
+            if cookie_header:
+                cookies = SimpleCookie()
+                try:
+                    cookies.load(cookie_header)
+                    morsel = cookies.get(SESSION_COOKIE_NAME)
+                    supplied_id = morsel.value if morsel is not None else None
+                except CookieError:
+                    supplied_id = None
+            session_id, _session, created = app.get_browser_session(supplied_id)
+            if created:
+                self._cookie_to_set = session_id
+            return session_id
+
+        def _write_session_cookie(self) -> None:
+            if self._cookie_to_set is None:
+                return
+            value = (
+                f"{SESSION_COOKIE_NAME}={self._cookie_to_set}; HttpOnly; "
+                "SameSite=Lax; Path=/; Max-Age=21600"
+            )
+            if app.cookie_secure:
+                value += "; Secure"
+            self.send_header("Set-Cookie", value)
+
         def do_GET(self) -> None:
             route = urlparse(self.path).path
             try:
                 if route == "/api/health":
-                    self._json(200, app.health())
+                    health = app.health()
+                    self._json(200 if health["ok"] else 503, health)
                     return
                 if route == "/api/state":
-                    self._json(200, app.state())
+                    session_id = self._request_session_id()
+                    self._json(200, app.state(session_id))
                     return
                 if route in STATIC_FILES:
                     path, content_type = STATIC_FILES[route]
@@ -456,32 +571,40 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
             except ApiError as exc:
                 self._json(exc.status, {"error": str(exc)})
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                logger.exception("Unhandled GET API error for %s", route)
+                self._json(500, {"error": "The server could not complete the request."})
 
         def do_POST(self) -> None:
             route = urlparse(self.path).path
             try:
+                if route not in {
+                    "/api/new", "/api/move", "/api/engine-move", "/api/pgn", "/api/resign"
+                }:
+                    self._json(404, {"error": "Not found"})
+                    return
                 payload = self._read_json()
                 if route == "/api/new":
-                    result = app.new_game(payload)
+                    session_id = self._request_session_id()
+                    result = app.new_game(session_id, payload)
                 elif route == "/api/move":
-                    result = app.play_player_move(payload)
+                    session_id = self._request_session_id()
+                    result = app.play_player_move(session_id, payload)
                 elif route == "/api/engine-move":
-                    result = app.play_engine_move()
+                    session_id = self._request_session_id()
+                    result = app.play_engine_move(session_id)
                 elif route == "/api/pgn":
                     result = app.parse_pgn(payload)
                 elif route == "/api/resign":
-                    result = app.resign()
-                else:
-                    self._json(404, {"error": "Not found"})
-                    return
+                    session_id = self._request_session_id()
+                    result = app.resign(session_id)
                 self._json(200, result)
             except ApiError as exc:
                 self._json(exc.status, {"error": str(exc)})
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"error": "The request body must be valid JSON."})
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                logger.exception("Unhandled POST API error for %s", route)
+                self._json(500, {"error": "The server could not complete the request."})
 
         def _read_json(self) -> dict[str, Any]:
             try:
@@ -502,6 +625,7 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._write_session_cookie()
             self.end_headers()
             self.wfile.write(body)
 
@@ -521,12 +645,19 @@ def make_handler(app: ChessApp) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(description="Run the Whisker local web app.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Whisker checkpoint (.pt or .pth)")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"),
+        default=os.getenv("WHISKER_DEVICE", "auto"),
+    )
+    parser.add_argument("--threads", type=int, default=int(os.getenv("WHISKER_THREADS", "1")))
+    parser.add_argument("--host", default=os.getenv("WHISKER_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be at least 1")
@@ -534,12 +665,22 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535")
 
     checkpoint = args.checkpoint
+    if checkpoint is None:
+        configured_checkpoint = os.getenv("WHISKER_CHECKPOINT_PATH")
+        checkpoint = Path(configured_checkpoint) if configured_checkpoint else None
     if checkpoint is not None and not checkpoint.is_absolute():
         checkpoint = (PROJECT_ROOT / checkpoint).resolve()
     elif checkpoint is None:
         checkpoint = find_checkpoint()
 
     app = ChessApp(checkpoint, args.device, args.threads)
+    if os.getenv("WHISKER_REQUIRE_MODEL", "0").lower() in {"1", "true", "yes", "on"}:
+        if not app.model_available:
+            app.close()
+            raise SystemExit(
+                "Whisker model initialization failed; refusing to start because "
+                "WHISKER_REQUIRE_MODEL is enabled. See server logs for details."
+            )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     print(f"Whisker is serving at http://{args.host}:{args.port}")
     if app.model_available:
@@ -552,6 +693,7 @@ def main() -> None:
         print("\nStopping Whisker.")
     finally:
         server.server_close()
+        app.close()
 
 
 if __name__ == "__main__":
