@@ -25,6 +25,8 @@ Download and parse monthly archives into four rating bands through 2200 Elo, the
 python -m src.download_months --year 2024
 # Limit this run to one month from the selected range:
 python -m src.download_months --year 2024 --start-month 1 --end-month 12 --month-count 1
+# Collect up to 50,000 complete games in each Elo band:
+python -m src.download_months --year 2024 --target-games-per-band 50000
 python -m src.train --data data/processed/elo-1000-1200 \
   --output-dir checkpoints/elo1000 --steps 50000
 # Defaults to batch size 512 and zero DataLoader subprocesses:
@@ -33,9 +35,25 @@ BATCH_SIZE=1024 bash train_curriculum.sh
 WORKERS=4 bash train_curriculum.sh
 ```
 
+`train_curriculum.sh` downloads and parses data for all four Elo bands before
+training, targeting 50,000 games per band by default, then runs the four
+training and fine-tuning stages. Set `DATA_YEAR`, `DATA_START_MONTH`, and
+`DATA_END_MONTH` to choose the archive range; set `GAMES_PER_BAND` to change
+the target. Set `DOWNLOAD_DATA=0` to train from prepared datasets instead.
+
 While one month is being parsed, the downloader fetches the next needed archive.
 It reuses/resumes temporary archives and removes each after all four band files
 are complete. Band limits are inclusive.
+
+`--target-games-per-band` counts complete games already present under the
+selected output directory and stops when every band reaches the target. If one
+year does not provide enough games, run another year with the same output
+directory. Training uses a deterministic 80/20 split grouped by game, and
+later curriculum stages replay 25% of sampled positions from earlier bands.
+Each stage writes `best_checkpoint.pt` using validation legal-move accuracy;
+the curriculum starts in a new `curriculum-v2-*` output directory by default.
+The current parser writes game IDs into HDF5, so old HDF5 files must be rebuilt
+once with `src.download_months.py` before this training script can use them.
 
 Fine-tune on a stronger band with optional replay from the base set using
 `python -m src.train --fine-tune CHECKPOINT --replay-data DATA --replay-ratio 0.25`.
@@ -55,6 +73,23 @@ python -m src.benchmark --checkpoint CHECKPOINT --stockfish stockfish \
 The benchmark plays both colors from varied openings and saves PGNs under
 `benchmark-results/`. Its Elo estimate depends on the Stockfish build and time
 control; it is not an online rating.
+
+## Build the deployment image
+
+The root `Dockerfile` builds a CPU-only web image and starts it with
+`python -m src.container_start`. For local testing, provide a non-empty
+checkpoint at `WHISKER_CHECKPOINT_PATH`; when it is absent, startup downloads
+the object named by `WHISKER_CHECKPOINT_BUCKET` and `WHISKER_CHECKPOINT_KEY`
+using the standard AWS credential chain. In ECS, grant the task role read access
+to that S3 object. The container listens on `PORT` (8080 by default), and
+`/api/health` returns 503 until the model loads. Set
+`WHISKER_COOKIE_SECURE=0` only for local plain-HTTP testing; the image defaults
+to secure cookies for HTTPS deployments.
+
+CodeBuild can build and push the image with the root `buildspec.yml`. Configure
+its `AWS_DEFAULT_REGION`, grant its role permission to push to the `whisker`
+ECR repository, enable privileged mode for Docker builds, and create the
+repository before the first build.
 
 ## Third-party assets
 

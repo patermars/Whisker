@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Tuple
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import h5py
+import chess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -235,8 +236,10 @@ class ChessDataset(Dataset):
 
         self.hdf5_paths: list[Path] = []
         self.lengths: list[int] = []
+        game_id_parts: list[np.ndarray] = []
         self.skipped_files: list[Path] = []
         self.incomplete_files: list[Path] = []
+        game_id_offset = 0
         for candidate in candidates:
             try:
                 with h5py.File(candidate, "r") as f:
@@ -248,6 +251,13 @@ class ChessDataset(Dataset):
                             f["policies"].shape[0] == length
                             and f["values"].shape[0] == length
                         )
+                    if valid_schema and "game_ids" not in f:
+                        raise ValueError(
+                            f"dataset {candidate} has no game IDs; reprocess it with "
+                            "the current src.prepare_data.py before training"
+                        )
+                    if valid_schema:
+                        valid_schema = f["game_ids"].shape[0] == length
                     incomplete = complete is not None and not bool(complete)
                     if (
                         not valid_schema
@@ -260,6 +270,12 @@ class ChessDataset(Dataset):
                         raise ValueError(f"incomplete or empty chess dataset: {candidate}")
                     self.hdf5_paths.append(candidate)
                     self.lengths.append(length)
+                    game_ids = np.asarray(f["game_ids"][:], dtype=np.int64)
+                    if game_ids.size and int(game_ids.min()) < 0:
+                        raise ValueError(f"dataset {candidate} has invalid negative game IDs")
+                    game_id_parts.append(game_ids + game_id_offset)
+                    if game_ids.size:
+                        game_id_offset += int(game_ids.max()) + 1
                     if incomplete:
                         self.incomplete_files.append(candidate)
             except OSError as exc:
@@ -273,6 +289,8 @@ class ChessDataset(Dataset):
 
         self._ends = np.cumsum(self.lengths)
         self._length = int(self._ends[-1])
+        self.game_ids = np.concatenate(game_id_parts)
+        self.game_count = int(np.unique(self.game_ids).size)
         self._files: Dict[int, h5py.File] = {}  # opened lazily per worker
 
     def __len__(self) -> int:
@@ -301,13 +319,27 @@ class ChessDataset(Dataset):
         )
 
 
+def concatenate_chess_datasets(datasets: list[ChessDataset]) -> Dataset:
+    """Concatenate datasets while assigning unique IDs to all source games."""
+    combined = ConcatDataset(datasets)
+    game_id_parts = []
+    offset = 0
+    for dataset in datasets:
+        game_id_parts.append(dataset.game_ids + offset)
+        if dataset.game_ids.size:
+            offset += int(dataset.game_ids.max()) + 1
+    combined.game_ids = np.concatenate(game_id_parts)
+    combined.game_count = sum(dataset.game_count for dataset in datasets)
+    return combined
+
+
 def make_data_loaders(
     dataset: ChessDataset,
     batch_size: int,
     num_workers: int,
-    replay_dataset: Optional[ChessDataset] = None,
+    replay_dataset: Optional[Dataset] = None,
     replay_ratio: float = 0.25,
-) -> Tuple[DataLoader, DataLoader]:
+):
     """Create loaders, optionally replay-sampling older data while fine-tuning.
 
     The target dataset supplies the validation split. When replay data is
@@ -315,15 +347,16 @@ def make_data_loaders(
     drawing the rest from the target dataset.
     """
 
-    def split(length: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-        if length < 2:
-            raise ValueError("each training dataset must contain at least two positions")
-        indices = np.arange(length)
-        np.random.RandomState(seed).shuffle(indices)
-        val_size = min(max(1, int(0.20 * length)), length - 1)
-        return indices[val_size:], indices[:val_size]
-
-    train_indices, val_indices = split(len(dataset), seed=42)
+    unique_games = np.unique(dataset.game_ids)
+    if unique_games.size < 2:
+        raise ValueError("each training dataset must contain at least two games")
+    np.random.RandomState(42).shuffle(unique_games)
+    val_game_count = min(max(1, int(0.20 * unique_games.size)), unique_games.size - 1)
+    val_game_ids = unique_games[:val_game_count]
+    val_positions = np.isin(dataset.game_ids, val_game_ids)
+    train_indices = np.flatnonzero(~val_positions)
+    val_indices = np.flatnonzero(val_positions)
+    train_game_count = int(unique_games.size - val_game_count)
     val_sampler = SubsetRandomSampler(val_indices.tolist())
 
     if replay_dataset is None:
@@ -334,11 +367,20 @@ def make_data_loaders(
             raise ValueError("--replay-ratio must be between 0 and 1 when --replay-data is set")
         if len(replay_dataset) < 1:
             raise ValueError("replay dataset must contain at least one position")
-        replay_indices = np.arange(len(replay_dataset))
-        np.random.RandomState(43).shuffle(replay_indices)
+        replay_games = np.unique(replay_dataset.game_ids)
+        if replay_games.size < 2:
+            raise ValueError("replay dataset must contain at least two games")
+        np.random.RandomState(43).shuffle(replay_games)
+        replay_val_game_count = min(
+            max(1, int(0.20 * replay_games.size)), replay_games.size - 1
+        )
+        replay_val_games = replay_games[:replay_val_game_count]
+        replay_train_indices = np.flatnonzero(
+            ~np.isin(replay_dataset.game_ids, replay_val_games)
+        )
         train_dataset = ConcatDataset(
             [Subset(dataset, train_indices.tolist()),
-             Subset(replay_dataset, replay_indices.tolist())]
+             Subset(replay_dataset, replay_train_indices.tolist())]
         )
         weights = torch.cat(
             [
@@ -348,15 +390,15 @@ def make_data_loaders(
                     dtype=torch.double,
                 ),
                 torch.full(
-                    (len(replay_indices),),
-                    replay_ratio / len(replay_indices),
+                    (len(replay_train_indices),),
+                    replay_ratio / len(replay_train_indices),
                     dtype=torch.double,
                 ),
             ]
         )
         train_sampler = WeightedRandomSampler(
             weights,
-            num_samples=len(train_indices) + len(replay_indices),
+            num_samples=len(train_indices) + len(replay_train_indices),
             replacement=True,
             generator=torch.Generator().manual_seed(42),
         )
@@ -382,7 +424,52 @@ def make_data_loaders(
         drop_last=False,
     )
 
-    return train_loader, val_loader
+    return (
+        train_loader,
+        val_loader,
+        len(train_indices),
+        len(val_indices),
+        train_game_count,
+        val_game_count,
+    )
+
+
+def legal_move_indices_from_planes(planes: np.ndarray) -> list[int]:
+    """Reconstruct legal move labels from the stored 18-plane board encoding."""
+    board = chess.Board(None)
+    piece_types = (
+        chess.PAWN,
+        chess.KNIGHT,
+        chess.BISHOP,
+        chess.ROOK,
+        chess.QUEEN,
+        chess.KING,
+    )
+    for plane, piece_type in enumerate(piece_types):
+        for row, col in np.argwhere(planes[plane] > 0.5):
+            board.set_piece_at(chess.square(int(col), int(row)), chess.Piece(piece_type, chess.WHITE))
+        for row, col in np.argwhere(planes[plane + 6] > 0.5):
+            board.set_piece_at(chess.square(int(col), int(row)), chess.Piece(piece_type, chess.BLACK))
+
+    castling_rights = 0
+    if planes[12, 0, 0] > 0.5:
+        castling_rights |= chess.BB_H1
+    if planes[13, 0, 0] > 0.5:
+        castling_rights |= chess.BB_A1
+    if planes[14, 0, 0] > 0.5:
+        castling_rights |= chess.BB_H8
+    if planes[15, 0, 0] > 0.5:
+        castling_rights |= chess.BB_A8
+    board.castling_rights = castling_rights
+
+    ep_squares = np.argwhere(planes[16] > 0.5)
+    board.ep_square = (
+        chess.square(int(ep_squares[0][1]), int(ep_squares[0][0]))
+        if len(ep_squares)
+        else None
+    )
+    board.turn = chess.WHITE if planes[17, 0, 0] > 0.5 else chess.BLACK
+    return [move.from_square * 64 + move.to_square for move in board.legal_moves]
 
 
 @torch.no_grad()
@@ -396,18 +483,25 @@ def validate(
 
     Metrics:
         val_policy_loss, val_value_loss, val_total_loss,
-        top1_accuracy, top5_accuracy, value_mae
+        raw_top1_accuracy, legal_top1_accuracy, top5_accuracy, value_mae
     """
     model.eval()
 
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_top1 = 0
+    total_legal_top1 = 0
     total_top5 = 0
     total_value_ae = 0.0
     total_samples = 0
 
     for boards, policies, values in val_loader:
+        batch_legal_indices = [
+            legal_move_indices_from_planes(board.numpy()) for board in boards
+        ]
+        legal_mask = np.zeros((len(batch_legal_indices), 4096), dtype=np.bool_)
+        for row, indices in enumerate(batch_legal_indices):
+            legal_mask[row, indices] = True
         boards = boards.to(device, non_blocking=True)
         policies = policies.to(device, non_blocking=True)
         values = values.to(device, non_blocking=True).unsqueeze(1)
@@ -423,6 +517,9 @@ def validate(
 
         pred_top1 = policy_logits.argmax(dim=1)
         total_top1 += (pred_top1 == policies).sum().item()
+        legal_mask_tensor = torch.from_numpy(legal_mask).to(policy_logits.device)
+        legal_top1 = policy_logits.masked_fill(~legal_mask_tensor, -torch.inf).argmax(dim=1)
+        total_legal_top1 += (legal_top1 == policies).sum().item()
 
         _, pred_top5 = policy_logits.topk(5, dim=1)
         total_top5 += (pred_top5 == policies.unsqueeze(1)).any(dim=1).sum().item()
@@ -438,7 +535,8 @@ def validate(
         "val_policy_loss": total_policy_loss / n,
         "val_value_loss": total_value_loss / n,
         "val_total_loss": (total_policy_loss + total_value_loss) / n,
-        "top1_accuracy": total_top1 / n * 100.0,
+        "raw_top1_accuracy": total_top1 / n * 100.0,
+        "legal_top1_accuracy": total_legal_top1 / n * 100.0,
         "top5_accuracy": total_top5 / n * 100.0,
         "value_mae": total_value_ae / n,
     }
@@ -455,6 +553,7 @@ def save_checkpoint(
     step: int,
     config: Dict[str, Any],
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    metrics: Optional[Dict[str, float]] = None,
 ) -> None:
     """Save a training checkpoint."""
     checkpoint = {
@@ -466,6 +565,8 @@ def save_checkpoint(
     }
     if scheduler is not None:
         checkpoint["scheduler"] = scheduler.state_dict()
+    if metrics is not None:
+        checkpoint["metrics"] = metrics
     torch.save(checkpoint, path)
 
 
@@ -639,8 +740,8 @@ def main() -> None:
         help="Initialize from model weights only; start a new training stage",
     )
     parser.add_argument(
-        "--replay-data", type=str, default=None,
-        help="Optional older HDF5 dataset to mix into a fine-tuning stage",
+        "--replay-data", nargs="+", default=None,
+        help="One or more older HDF5 datasets to mix into a fine-tuning stage",
     )
     parser.add_argument(
         "--replay-ratio", type=float, default=0.25,
@@ -683,8 +784,13 @@ def main() -> None:
         parser.error("--replay-data requires --fine-tune")
     if args.replay_data and not 0.0 < args.replay_ratio < 1.0:
         parser.error("--replay-ratio must be between 0 and 1")
-    if args.replay_data and os.path.realpath(args.replay_data) == os.path.realpath(args.data):
-        parser.error("--replay-data and --data must point to different HDF5 files")
+    if args.replay_data:
+        target_path = os.path.realpath(args.data)
+        replay_paths = [os.path.realpath(path) for path in args.replay_data]
+        if target_path in replay_paths:
+            parser.error("--replay-data and --data must point to different datasets")
+        if len(set(replay_paths)) != len(replay_paths):
+            parser.error("--replay-data must not contain duplicate datasets")
     if args.steps < 1 or args.batch_size < 1:
         parser.error("--steps and --batch-size must be positive")
     if args.workers < 0:
@@ -746,7 +852,10 @@ def main() -> None:
 
     dataset = ChessDataset(args.data, allow_incomplete=args.allow_incomplete_data)
     config["data_files"] = [str(path.resolve()) for path in dataset.hdf5_paths]
-    logger.info(f"Dataset: {len(dataset):,} positions from {args.data}")
+    logger.info(
+        f"Dataset: {len(dataset):,} positions from {dataset.game_count:,} games "
+        f"in {args.data}"
+    )
     if len(dataset.hdf5_paths) > 1:
         logger.info(f"Combined {len(dataset.hdf5_paths)} monthly HDF5 files")
     if dataset.skipped_files:
@@ -762,34 +871,46 @@ def main() -> None:
 
     replay_dataset = None
     if args.replay_data:
-        replay_dataset = ChessDataset(
-            args.replay_data, allow_incomplete=args.allow_incomplete_data
-        )
+        replay_datasets = [
+            ChessDataset(path, allow_incomplete=args.allow_incomplete_data)
+            for path in args.replay_data
+        ]
+        replay_dataset = concatenate_chess_datasets(replay_datasets)
         logger.info(
-            f"Replay dataset: {len(replay_dataset):,} positions from {args.replay_data} "
+            f"Replay dataset: {len(replay_dataset):,} positions from "
+            f"{replay_dataset.game_count:,} games across {len(args.replay_data)} dataset(s) "
             f"({args.replay_ratio:.0%} of sampled training positions)"
         )
-        if replay_dataset.skipped_files:
-            logger.warning(
-                "Ignored incomplete or empty replay files: "
-                + ", ".join(str(path) for path in replay_dataset.skipped_files)
-            )
-        if replay_dataset.incomplete_files:
-            logger.warning(
-                "Using partial replay HDF5 files saved by an interrupted parse: "
-                + ", ".join(str(path) for path in replay_dataset.incomplete_files)
-            )
+        for replay_source, replay_part in zip(args.replay_data, replay_datasets):
+            if replay_part.skipped_files:
+                logger.warning(
+                    f"Ignored incomplete or empty replay files from {replay_source}: "
+                    + ", ".join(str(path) for path in replay_part.skipped_files)
+                )
+            if replay_part.incomplete_files:
+                logger.warning(
+                    f"Using partial replay HDF5 files from {replay_source}: "
+                    + ", ".join(str(path) for path in replay_part.incomplete_files)
+                )
 
-    train_loader, val_loader = make_data_loaders(
+    (
+        train_loader,
+        val_loader,
+        train_size,
+        val_size,
+        train_game_count,
+        val_game_count,
+    ) = make_data_loaders(
         dataset,
         args.batch_size,
         args.workers,
         replay_dataset=replay_dataset,
         replay_ratio=args.replay_ratio,
     )
-    val_size = max(1, int(0.02 * len(dataset)))
-    train_size = len(dataset) - val_size
-    logger.info(f"Split: {train_size:,} train / {val_size:,} val (80/20)")
+    logger.info(
+        f"Split: {train_size:,} train / {val_size:,} val positions; "
+        f"{train_game_count:,} train / {val_game_count:,} validation games (80/20)"
+    )
 
     model = Whisker(
         channels=args.channels,
@@ -842,6 +963,70 @@ def main() -> None:
 
     tracker = ExperimentTracker(config, args.output_dir)
     logger.info(f"Logging backend: {tracker.backend}")
+
+    best_checkpoint_path = Path(args.output_dir) / "best_checkpoint.pt"
+    best_legal_top1 = float("-inf")
+    best_policy_loss = float("inf")
+    best_step = 0
+    if best_checkpoint_path.is_file():
+        try:
+            best_checkpoint = torch.load(
+                best_checkpoint_path, map_location="cpu", weights_only=False
+            )
+            best_metrics = best_checkpoint.get("metrics", {})
+            best_legal_top1 = float(best_metrics.get("legal_top1_accuracy", float("-inf")))
+            best_policy_loss = float(best_metrics.get("val_policy_loss", float("inf")))
+            best_step = int(best_checkpoint.get("step", 0))
+            logger.info(
+                f"Best checkpoint so far: step={best_step:,}, "
+                f"legal_top1={best_legal_top1:.2f}%"
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("Could not read existing best checkpoint metadata: %s", exc)
+
+    last_validation_step = 0
+
+    def evaluate_and_save_best(validation_step: int) -> Dict[str, float]:
+        nonlocal best_legal_top1, best_policy_loss, best_step, last_validation_step
+        val_metrics = validate(model, val_loader, device)
+        last_validation_step = validation_step
+        tracker.log(val_metrics, validation_step)
+        logger.info(
+            f"[VAL] step={validation_step:>7,} | "
+            f"p_loss={val_metrics['val_policy_loss']:.4f} | "
+            f"v_loss={val_metrics['val_value_loss']:.4f} | "
+            f"legal_top1={val_metrics['legal_top1_accuracy']:.2f}% | "
+            f"raw_top1={val_metrics['raw_top1_accuracy']:.2f}% | "
+            f"top5={val_metrics['top5_accuracy']:.2f}% | "
+            f"v_mae={val_metrics['value_mae']:.4f}"
+        )
+        current_legal_top1 = val_metrics["legal_top1_accuracy"]
+        current_policy_loss = val_metrics["val_policy_loss"]
+        improves = current_legal_top1 > best_legal_top1 or (
+            current_legal_top1 == best_legal_top1
+            and current_policy_loss < best_policy_loss
+        )
+        if improves:
+            temp_path = best_checkpoint_path.with_suffix(".tmp")
+            save_checkpoint(
+                str(temp_path),
+                model,
+                optimizer,
+                scaler,
+                validation_step,
+                config,
+                scheduler,
+                metrics=val_metrics,
+            )
+            os.replace(temp_path, best_checkpoint_path)
+            best_legal_top1 = current_legal_top1
+            best_policy_loss = current_policy_loss
+            best_step = validation_step
+            logger.info(
+                f"[BEST] step={best_step:,} | legal_top1={best_legal_top1:.2f}% | "
+                f"saved {best_checkpoint_path}"
+            )
+        return val_metrics
 
     logger.info(f"Starting training for {args.steps:,} steps (batch_size={args.batch_size})")
     model.train()
@@ -911,16 +1096,7 @@ def main() -> None:
                 samples_since_log = 0
 
             if step % 5_000 == 0:
-                val_metrics = validate(model, val_loader, device)
-                tracker.log(val_metrics, step)
-                logger.info(
-                    f"[VAL] step={step:>7,} | "
-                    f"p_loss={val_metrics['val_policy_loss']:.4f} | "
-                    f"v_loss={val_metrics['val_value_loss']:.4f} | "
-                    f"top1={val_metrics['top1_accuracy']:.2f}% | "
-                    f"top5={val_metrics['top5_accuracy']:.2f}% | "
-                    f"v_mae={val_metrics['value_mae']:.4f}"
-                )
+                evaluate_and_save_best(step)
 
             if step % 10_000 == 0:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
@@ -929,6 +1105,9 @@ def main() -> None:
                 logger.info(f"[CKPT] Saved {ckpt_path}")
 
             pbar.update(1)
+
+        if last_validation_step != step:
+            evaluate_and_save_best(step)
 
     except KeyboardInterrupt:
         interrupted = True
@@ -950,6 +1129,10 @@ def main() -> None:
             save_checkpoint(final_path, model, optimizer, scaler, step, config, scheduler)
         retain_only_checkpoint(args.output_dir, final_path, logger)
         logger.info(f"Final checkpoint: {final_path}")
+        logger.info(
+            f"Best validation checkpoint: {best_checkpoint_path} "
+            f"(step={best_step:,}, legal_top1={best_legal_top1:.2f}%)"
+        )
         logger.info("Training complete.")
 
 

@@ -12,6 +12,7 @@
 /wandb/
 **/tb_logs/
 training.log
+logs/
 
 # Python bytecode and build artifacts
 __pycache__/

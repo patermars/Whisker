@@ -53,8 +53,10 @@ def file_matches_request(
                 == (-1 if max_games is None else max_games)
                 and float(dataset.attrs.get("sample_rate", 1.0)) == sample_rate
                 and all(name in dataset for name in ("boards", "policies", "values"))
+                and "game_ids" in dataset
                 and dataset["boards"].shape[0] == dataset["policies"].shape[0]
                 and dataset["boards"].shape[0] == dataset["values"].shape[0]
+                and dataset["boards"].shape[0] == dataset["game_ids"].shape[0]
             )
     except (OSError, KeyError, TypeError, ValueError):
         return False
@@ -77,6 +79,28 @@ def month_is_complete(
         )
         for min_elo, max_elo in ELO_BANDS
     )
+
+
+def complete_game_counts(output_root: Path) -> dict[tuple[int, int], int]:
+    """Count complete, game-ID-enabled records already present per Elo band."""
+    counts: dict[tuple[int, int], int] = {}
+    for low, high in ELO_BANDS:
+        total = 0
+        band_dir = output_root / f"elo-{low}-{high}"
+        for path in band_dir.glob("*.h5"):
+            try:
+                with h5py.File(path, "r") as dataset:
+                    if (
+                        not bool(dataset.attrs.get("complete", False))
+                        or "game_ids" not in dataset
+                        or dataset["game_ids"].shape[0] != dataset["boards"].shape[0]
+                    ):
+                        continue
+                    total += int(dataset.attrs.get("game_count", 0))
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+        counts[(low, high)] = total
+    return counts
 
 
 def _content_range_total(value: str | None) -> tuple[int | None, int | None] | None:
@@ -599,6 +623,10 @@ def main() -> None:
         help="Optional cap per Elo band per month; by default process every qualifying game",
     )
     parser.add_argument(
+        "--target-games-per-band", type=int, default=None,
+        help="Stop after this many complete games have been collected in every Elo band",
+    )
+    parser.add_argument(
         "--workers", type=int, default=available_cpu_count(),
         help=f"CPU worker processes for game encoding (default: {available_cpu_count()})",
     )
@@ -636,6 +664,8 @@ def main() -> None:
         parser.error("--month-count must be positive")
     if args.max_games is not None and args.max_games < 1:
         parser.error("--max-games must be positive")
+    if args.target_games_per_band is not None and args.target_games_per_band < 1:
+        parser.error("--target-games-per-band must be positive")
     if args.workers < 1:
         parser.error("--workers must be positive")
     if args.download_retries < 1:
@@ -668,6 +698,11 @@ def main() -> None:
         flush=True,
     )
     print(f"CPU encoding workers: {args.workers}", flush=True)
+    if args.target_games_per_band is not None:
+        print(
+            f"Target: {args.target_games_per_band:,} complete games per Elo band",
+            flush=True,
+        )
 
     completed_months = 0
     failures: list[str] = []
@@ -703,10 +738,21 @@ def main() -> None:
         partial_path.unlink(missing_ok=True)
         metadata_path.unlink(missing_ok=True)
 
+    def target_reached() -> bool:
+        if args.target_games_per_band is None:
+            return False
+        counts = complete_game_counts(output_root)
+        return all(
+            counts[band] >= args.target_games_per_band for band in ELO_BANDS
+        )
+
     download_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="month-download")
     pending_download: tuple[str, Future[Path]] | None = None
     try:
         for index, month in enumerate(months):
+            if target_reached():
+                print("[target met] requested complete-game count reached in every band", flush=True)
+                break
             archive_path, _, _ = archive_paths(month)
             if not args.overwrite and month_is_complete(
                 output_root, month, args.max_games, sample_rates
@@ -728,9 +774,12 @@ def main() -> None:
                     (
                         candidate
                         for candidate in months[index + 1:]
-                        if args.overwrite
-                        or not month_is_complete(
-                            output_root, candidate, args.max_games, sample_rates
+                        if not target_reached()
+                        and (
+                            args.overwrite
+                            or not month_is_complete(
+                                output_root, candidate, args.max_games, sample_rates
+                            )
                         )
                     ),
                     None,
@@ -778,11 +827,25 @@ def main() -> None:
         download_pool.shutdown(wait=True, cancel_futures=True)
 
     print(f"\nFinished: {completed_months}/{len(months)} months complete.")
+    final_game_counts = complete_game_counts(output_root)
+    for band in ELO_BANDS:
+        print(
+            f"  {band[0]}-{band[1]}: {final_game_counts[band]:,} complete games",
+            flush=True,
+        )
     if failures:
         print("Resume by running the same command again:")
         for failure in failures:
             print(f"  - {failure}")
         raise SystemExit(1)
+
+    if args.target_games_per_band is not None and not all(
+        final_game_counts[band] >= args.target_games_per_band for band in ELO_BANDS
+    ):
+        raise SystemExit(
+            "Requested game target was not reached in the selected month range. "
+            "Run additional year/month ranges using the same output directory."
+        )
 
     print(
         "Train on a band with: "
